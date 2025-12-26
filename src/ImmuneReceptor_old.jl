@@ -12,28 +12,35 @@ using ProgressMeter: @showprogress
 
 using Nucleus
 
+# TO DO (in progress) - allow for analysis of multiple chains per cell, paired graphing, etc.
+
+
 # =============================================================================================== #
-# Reading
+# Reading / Misc
 # =============================================================================================== #
 
+# ✅ checked
 function is_t_gene(::Any)
 
     false
 
 end
 
+# ✅ checked
 function is_t_gene(st::AbstractString)
 
     startswith(st, 'T')
 
 end
 
+# ✅ checked
 function is_cdr3(st)
 
     st[1] == 'C' && st[end] == 'F'
 
 end
 
+# ✅ checked
 function load_cdr3s(csvpath)
     df = CSV.read(csvpath, DataFrame)
     chain_keep_a = df.chain .∈ Ref(["TRG", "TRD", "TRA", "TRB"])
@@ -81,7 +88,7 @@ function writ(ht, st, a1_, a2_)
 end
 
 # =============================================================================================== #
-# MISC
+# VJ
 # =============================================================================================== #
 
 function make_dictionary(an_)
@@ -90,16 +97,40 @@ function make_dictionary(an_)
 
 end
 
+function make_vj(s1_, s2_)
+
+    u1_ = unique(s1_)
+
+    u2_ = unique(s2_)
+
+    U = zeros(Int, lastindex(u1_), lastindex(u2_))
+
+    d1 = make_dictionary(u1_)
+
+    d2 = make_dictionary(u2_)
+
+    for nd in eachindex(s1_)
+
+        U[d1[s1_[nd]], d2[s2_[nd]]] += 1
+
+    end
+
+    u1_, u2_, U
+
+end
+
 # =============================================================================================== #
 # CDR3
 # =============================================================================================== #
 
+# ✅ checked
 function make_hamming_distance(s1, s2)
 
     sum(s1[nd] != s2[nd] for nd in eachindex(s1))
 
 end
 
+# ✅ checked
 function make_distance(st_)
 
     u1 = lastindex(st_)
@@ -140,6 +171,7 @@ end
 
 # count whether motif is present at least once per cdr3 for all cdr3s
 
+# ✅ checked
 function get_motif_counts(
     motif::AbstractVector{<:AbstractString},
     cdrs::AbstractVector{<:AbstractString},
@@ -157,6 +189,7 @@ function get_motif_counts(
 
 end
 
+# ✅ checked
 # makes list of motifs in cdr3s, counts them, filters based on a cutoff, then provides set count
 function get_motifs(st_::AbstractVector{<:AbstractString}, min::Int, max::Int)
 
@@ -285,11 +318,57 @@ function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif)
     return in__, po_
 end
 
+#_________#
+
+function get_motif(s1::AbstractString, um)
+
+    s2 = s1[4:(end-3)]
+
+    # TODO: Use Set
+    st_ = String[]
+
+    i1 = 0
+
+    i2 = i1 + um - 1
+
+    while i2 < lastindex(s2)
+
+        push!(st_, s2[(i1+=1):(i2+=1)])
+
+    end
+
+    st_
+
+end
+
+function get_motif(st__, u1)
+
+    di = Dict{String,Int}()
+
+    for nd in eachindex(st__), st in st__[nd]
+
+        if !haskey(di, st)
+
+            di[st] = 0
+
+        end
+
+        di[st] += 1
+
+    end
+
+    [st for (st, u2) in di if u1 <= u2]
+
+end
+
+
 # =============================================================================================== #
 # Graphing
 # =============================================================================================== #
 
-function make_vertices!(g, cdrs)
+# TO DO: change label of vertices to the cell barcode, to allow for pairing analyses.
+
+function make_cdr3_vertices!(g, cdrs)
     isblank(x) = x === nothing || x === missing || x in ("None", "none", "NA", "na", "Na", " ", "  ", "")
 
     for row in 1:nrow(cdrs)
@@ -316,6 +395,50 @@ function make_vertices!(g, cdrs)
 
 end
 
+function make_barcode_vertices!(g, cdrs)
+    isblank(x) = x === nothing || x === missing || x in ("None", "none", "NA", "na", "Na", " ", "  ", "", "   ")
+
+    if :row_index ∉ names(cdrs)
+            cdrs.row_index = collect(1:nrow(cdrs))
+        end
+
+    grouped_by_barcode = groupby(cdrs, :barcode)
+
+    chain_rows = Dict{String, Vector{Int}}()
+
+    for (i, subgroup) in enumerate(grouped_by_barcode)
+
+        bc = String(sub.subgroup[1]) # get barcode for group
+
+        if !has_vertex(g, bc)
+            add_vertex!(g, bc, Dict(:index => i, :barcode => bc))
+        end
+
+        for row in 1:nrow(subgroup) # make dictionary for each vertex (barcode) of all chains for that barcode w/ row index
+
+            if !isblank(subgroup.chain[row])
+                chain = String(subgroup.chain[row])
+            end
+
+            chain_index = subgroup.row_index[row]  # original row index in `cdrs`
+
+            chain_row_pair = get!(chain_rows, chain, Int[])
+            push!(chain_row_pair, chain_index)
+
+        end
+
+        g[bc][:chains] = chain_rows # add dictionary to vertex
+
+        if :sample ∈ names(subgroup) && !isblank(subgroup.sample[1]) # add sample if it exisrts
+            g[bc][:sample] = subgroup.sample[1]
+        end
+
+    end # end of subgroup loop
+
+    return g
+
+end
+
 # make a global edge w/ annotation of hamming disrance
 function add_global_edge!(g, u, v, distance)
     add_edge!(g, u, v, Dict(:distance => distance))
@@ -326,7 +449,7 @@ function add_local_edge!(g, u, v, motif::String, pval)
     add_edge!(g, u, v, Dict(:motif => motif, :mpval => pval))
 end
 
-# initialises the graph and makes edges
+# go through cdrs
 function make_edges(cdrs, motifs, isglobal, islocal)
 
     cdr3_vec = String.(cdrs.cdr3)
@@ -394,6 +517,95 @@ function make_edges(cdrs, motifs, isglobal, islocal)
 
 end
 
+function get_cdr3s_for_vertex_chain(g, cdrs, bc::String, chain::String) # get cdr3s from graph indices for each barcode
+    vertex = g[bc]
+    haskey(vertex, :cdr3_rows_by_chain) || return String[]
+    rows = get(vertex[:cdr3_rows_by_chain], chain, Int[])
+    return String.(cdrs.cdr3[rows]) # retrieve list of all cdr3s for that barcode
+end
+
+function make_barcode_graph(g, cdrs)
+
+    cdr3_vec = String.(cdrs.cdr3)
+
+    g = MetaGraph(
+        Graph();
+        label_type=String,
+        vertex_data_type=Dict{Symbol,Any},
+        edge_data_type=Dict{Symbol,Any},
+    )
+
+    g = make_barcode_vertices!(g, cdrs)
+
+    return g
+
+end
+
+function make_global_edges(g, cdrs; chain::String = "TRB", max_distance::Int = 1,)
+
+    # subset dataframe to specific chain and get list of barcodes
+
+    filtered_cdrs = subset(cdrs, :chain => ByRow(x -> x == chain))
+
+    #barcodes = unique(filtered_cdrs.barcode)
+
+    # using filtered df, make distances
+    # go through index pairs and distances and check cutoff
+    # if cutoff is good, find the row_index and add a global edge annotated with the specific chain
+
+    cdr3s = String.(filtered_cdrs.cdr3)
+
+    index_pairs, dists = make_distance(cdr3s)
+
+    for (index, (i, j)) in enumerate(pairs)
+
+        d = dists[index]
+
+        if d <= 1
+
+            bc_1 = String(filtered_cdrs.barcode[i])
+            bc_2 = String(filtered_cdrs.barcode[j])
+            cdr3_1 = String(filtered_cdrs.row_index[i])
+            cdr3_2 = String(filtered_cdrs.row_index[j])
+
+            bc_1 == bc_2 && continue
+
+            if !has_vertex(g, bc_1)
+                add_vertex!(g, bc_1, Dict(:barcode => bc_1))
+            end
+
+            if !has_vertex(g, bc_2)
+                add_vertex!(g, bc_2, Dict(:barcode => bc_2))
+            end
+
+            add_global_edge!(g, bc_1, bc_2, d)
+            g[bc_1, bc_2][:chains] = (cdr3_1, cdr3_2) # for now track the indices so that later people can go back to see pairs 4 the edges if they wany
+        end
+
+    end
+
+
+end
+
+function make_local_edges(g, cdrs; chain::String = "TRB", max_distance::Int = 1,)
+
+    filtered_cdrs = subset(cdrs, :chain => ByRow(x -> x == chain))
+
+    barcodes = unique(filtered_cdrs.barcode)
+
+
+
+    # subset dataframe to specific chain and get list of barcodes
+
+    # go through each vertex with those barcodes
+    # filter chain dictionary to only the specific chain
+    # then go through the indexes , i , i+1
+    # checkthrough every motif to see if they have any shared and add a local edge for that
+    # add a global edge for those with matches with a note on the cdr3 indexes involved in the edge
+
+
+
+end
 
 # =============================================================================================== #
 # Clusters / Significance
@@ -406,6 +618,7 @@ end
 
 using StatsBase: mode
 
+# 📋 TO DO: change to use barcodes and use cdr table as a lookup to get cdr3 length
 function find_length_pvals(g, cdrs2, sim_depth)
     clusters = connected_components(g)
 
@@ -474,6 +687,8 @@ end
 
 using Distributions
 
+# 📋 TO DO: change to use barcodes and use cdr table to find vgenes for each pair? cell? individual chain?
+# decide what to do re: that soon - might make sense to just score within all TRB, then TRA, TRG, etc. etc.
 function score_vgene(g, sim_depth)
     clusters = connected_components(g)
 
@@ -573,11 +788,14 @@ end
 # check hla file for shared hlas
 # do enrichment exactly as done for v-genes
 
+
 function allele_group(allele::String)
     m = match(r"^(HLA-)?([A-Z]{1,4}\d?)", allele)
     return m === nothing ? allele : m.captures[end]
 end
 
+# 📋 TO DO: check to make sure its fully working using some mock data w/ fake donor names and the test cdr3 dataset
+# also change to barcode system as above for other functions
 function score_hla(g)
     clusters = connected_components(g, hla_df)
 
