@@ -391,6 +391,46 @@ function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif)
     return in__, po_
 end
 
+function make_motif_pairs_new(st_::AbstractVector{<:AbstractString}, motif)
+    u1 = lastindex(st_)
+    u2 = div(u1 * (u1 - 1), 2)
+    l = length(motif)
+
+    in__ = Vector{Tuple{Int,Int}}(undef, u2)
+    po_ = Vector{Int}(undef, u2)
+
+    i1 = 0
+
+    for i2 in 1:u1, i3 in (i2+1):u1
+        s1, s2 = st_[i2], st_[i3]
+
+        has1 = occursin(motif, s1)
+        has2 = occursin(motif, s2)
+
+        if has1 && has2
+
+            nd1 = findfirst(motif, s1)
+            nd2 = findfirst(motif, s2)
+
+            a1, a2 = start(nd1), stop(nd1)
+            b1, b2 = start(nd2), stop(nd2)
+
+            if max(a1, b1) ≤ min(a2, b2) + 3
+
+                i1 += 1
+                in__[i1] = (i2, i3)
+                po_[i1] = 1
+
+            end
+        end
+    end
+
+    resize!(in__, i1)
+    resize!(po_, i1)
+
+    return in__, po_
+end
+
 # =============================================================================================== #
 # Graphing
 # =============================================================================================== #
