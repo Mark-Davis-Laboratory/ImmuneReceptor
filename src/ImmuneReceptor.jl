@@ -13,8 +13,10 @@ using ProgressMeter: @showprogress
 using Nucleus
 
 # to do:
-# -> add index tracking to the motif function
-# -> add a way to check for index / window overlap
+# -> add index tracking to the motif function ✅
+# -> add a way to check for index / window overlap ✅
+# -> add implementation of blosum function in the make edges
+# -> combine blosum functions into one ?
 
 # =============================================================================================== #
 # Reading
