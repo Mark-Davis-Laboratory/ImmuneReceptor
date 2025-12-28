@@ -12,6 +12,10 @@ using ProgressMeter: @showprogress
 
 using Nucleus
 
+# to do:
+# -> add index tracking to the motif function
+# -> add a way to check for index / window overlap
+
 # =============================================================================================== #
 # Reading
 # =============================================================================================== #
@@ -667,7 +671,6 @@ function score_vgene(g, sim_depth)
 end
 
 #_______________#
-
 
 # hla score
 
