@@ -16,7 +16,7 @@ using Nucleus
 # -> add index tracking to the motif function ✅
 # -> add a way to check for index / window overlap ✅
 # -> add implementation of blosum function in the make edges
-# -> combine blosum functions into one ?
+# -> combine blosum functions into one ✅
 
 # =============================================================================================== #
 # Reading
@@ -106,23 +106,6 @@ function make_hamming_distance(s1, s2)
 
 end
 
-# new function for scoring hamming distances
-function make_hamming_distance_new(s1, s2)
-
-    @assert length(s1) == length(s2)
-
-    mismatch_indices = Int[]
-
-    for nd in eachindex(s1)
-        if s1[nd] != s2[nd]
-            push!(mismatch_count, nd)
-        end
-    end
-
-    return mismatch_indices
-
-end
-
 const blosum62 = Dict{Tuple{Char,Char},Int}(
     ('A','A')=>4,  ('A','R')=>-1, ('A','N')=>-2, ('A','D')=>-2, ('A','C')=>0,
     ('A','Q')=>-1, ('A','E')=>-1, ('A','G')=>0,  ('A','H')=>-2, ('A','I')=>-1,
@@ -195,7 +178,21 @@ const blosum62 = Dict{Tuple{Char,Char},Int}(
     ('V','V')=>4
 )
 
-function make_blosum_score(s1, s2, mismatch_indices)
+function make_blosum_score(s1, s2)
+
+    @assert length(s1) == length(s2)
+
+    mismatch_indices = Int[]
+
+    for nd in eachindex(s1)
+        if s1[nd] != s2[nd]
+            push!(mismatch_indices, nd)
+        end
+    end
+
+    if isempty(mismatch_indices) || length(mismatch_indices) > 1
+            return length(mismatch_indices)
+    end
 
     nd = mismatch_indices[1]
 
