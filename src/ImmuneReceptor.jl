@@ -17,6 +17,8 @@ using Nucleus
 # -> add a way to check for index / window overlap ✅
 # -> add implementation of blosum function in the make edges
 # -> combine blosum functions into one ✅
+# -> create function to make like a nice summary file
+# -> implement fisher's exact test for cluster significance
 
 # =============================================================================================== #
 # Reading
