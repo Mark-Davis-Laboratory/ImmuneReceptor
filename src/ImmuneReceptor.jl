@@ -457,6 +457,10 @@ function make_vertices!(g, cdrs)
             g[label][:dgene] = cdrs.d_gene[row]
         end
 
+        if !isblank(cdrs.donor[row])
+            g[label][:donor] = cdrs.donor[row]
+        end
+
     end
 
     return g # return graph
@@ -470,7 +474,10 @@ end
 
 # add a local edge w/ annotation of motif and the pval (from get_significant_motifs)
 function add_local_edge!(g, u, v, motif::String, pval)
-    add_edge!(g, u, v, Dict(:motif => motif, :mpval => pval))
+    add_edge!(g, u, v, Dict(
+        :motifs => [motif],
+        :motif_pvals => [pval],
+    ))
 end
 
 # initialises the graph and makes edges
@@ -528,8 +535,8 @@ function make_edges(cdrs, motifs, isglobal, islocal)
                 v = cdr3_vec[matches[j]]
 
                 if haskey(g, u, v)
-                    g[u, v][:motif] = motif
-                    g[u, v][:mpval] = pval
+                    push!(g[u, v][:motifs], motif)
+                    push!(g[u, v][:motif_pvals], pval)
                 else
                     add_local_edge!(g, u, v, motif, pval)
                 end
@@ -740,9 +747,9 @@ function score_hla(g)
 
         for vertex in cluster
 
-            sample = g[label_for(g, vertex)][:sample]
+            donor = g[label_for(g, vertex)][:donor]
 
-            row_index = findfirst(==(sample), hla_df.donor)
+            row_index = findfirst(==(donor), hla_df.donor)
             row_index === nothing && continue # skip typing for donors without HLA type
             row = hla_df[row_index, 2:end]
 
@@ -805,5 +812,82 @@ function score_hla(g)
 
     return pval_df
     # heatmap_df = unstack(df, :cluster, :allele, :pval)
+
+end
+
+
+# motif scoring
+
+
+
+
+# =============================================================================================== #
+# Summarising
+# =============================================================================================== #
+#
+
+# create function to report for each cluster:
+# -> number of members
+# -> number of unique donors and unique clones (unique alpha and beta?) - less of a priority
+# -> length of cdr3 p-val
+# -> motif p-val
+# -> v-gene pval
+# -> hla p-vals
+# -> list of probable hla types
+
+# length -> vector of p-vals
+# indexed dictionary with correct p-val of most significant v-gene
+
+function summarize_data(g, vgene_pvals, length_pvals)
+
+    # get cluster sizes
+
+    clusters = connected_components(g)
+
+    # things to count:
+    # unique members, unique cdr3s, (later - unique clones)
+    # find most significant motif p-val
+
+    # make vector w/ dictionary of vgenes
+    cluster_sizes = Vector{Dict{String,Int}}(undef, length(clusters))
+    totals = Dict{String,Int}()
+    cluster_sizes = Vector{Int}(undef, length(clusters))
+    donor_sizes = Vector{Int}(undef, length(clusters))
+    length_pval = Vector{Float64}(undef, length(clusters))
+
+    # get cluster sizes and no. donors
+    for (index, cluster) in enumerate(clusters)
+        donors = Vector{String}()
+        cluster_sizes[index] = length(cluster)
+
+        for vertex in cluster
+            donor = g[label_for(g, vertex)][:donor] # should be fixed now!
+            donors[vertex] = donor
+        end
+
+        donor_sizes[index] = length(unique(donors))
+
+    end
+
+    vgenes = [first(keys(i)) for i in vgene_pvals]
+    v_pvals  = [first(values(i)) for i in vgene_pvals]
+
+    df = DataFrame(
+        group = Int64[],
+        no_member = cluster_sizes,
+        no_donor = donor_sizes,
+        length_pval = length_pvals,
+        vgene_pval = v_pvals,
+        vgene = vgenes,
+        motif_pval = Int64[],
+        #motif = String[]
+    )
+
+
+    # create DataFrame
+    # fill in iteratively with everything
+    #
+
+
 
 end
