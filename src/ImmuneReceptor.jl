@@ -19,6 +19,7 @@ using Nucleus
 # -> combine blosum functions into one ✅
 # -> create function to make like a nice summary file
 # -> implement fisher's exact test for cluster significance
+# -> edit scoring functions to either consistently use vector of dictionary or tuple
 
 # =============================================================================================== #
 # Reading
@@ -817,6 +818,50 @@ end
 
 
 # motif scoring
+
+using Graphs
+
+function collect_cluster_motifs(g)
+    clusters = connected_components(g)
+    cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
+
+    for (index, cluster) in enumerate(clusters)
+        in_cluster = falses(nv(g))
+        in_cluster[cluster] .= true # find cluster members
+
+        pairs = Tuple{String,Float64}[]
+
+        for u in cluster
+
+            for v in neighbors(g, u)
+
+                if in_cluster[v] && u < v   # avoid double counting
+
+                    if haskey(g[u, v], :motifs) && haskey(g[u, v], :motif_pvals)
+
+                        motifs = g[u, v][:motifs]
+                        pvals  = g[u, v][:motif_pvals]
+
+                        @assert length(motifs) == length(pvals)
+
+                        for ind in eachindex(motifs) # store paired motif and pval
+
+                            push!(pairs, (motifs[ind], pvals[ind]))
+
+                        end
+
+                    end
+                end
+            end
+
+        end
+
+        cluster_motifs[index] = pairs
+
+    end
+
+    return cluster_motifs
+end
 
 
 
