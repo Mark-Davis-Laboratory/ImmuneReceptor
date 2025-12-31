@@ -14,7 +14,7 @@ using Nucleus
 
 # to do:
 # -> add index tracking to the motif function ✅
-# -> add a way to check for index / window overlap ✅
+# -> add a way to check for index / window overlap (done + updated) ✅
 # -> add implementation of blosum function in the make edges
 # -> combine blosum functions into one ✅
 # -> create function to make like a nice summary file ✅
@@ -233,7 +233,7 @@ function make_blosum_score(s1, s2)
 
 end
 
-function make_distance(st_)
+function make_distance(st_, ids)
 
     u1 = lastindex(st_)
 
@@ -241,14 +241,13 @@ function make_distance(st_)
 
     in__ = Vector{Tuple{Int,Int}}(undef, u2)
 
-    po_ = Vector{Int}(undef, u2)
+    po_  = Vector{Int}(undef, u2)
 
     i1 = 0
 
     @showprogress for i2 in 1:u1, i3 in (i2+1):u1
 
         s1 = st_[i2]
-
         s2 = st_[i3]
 
         if lastindex(s1) != lastindex(s2)
@@ -257,15 +256,17 @@ function make_distance(st_)
 
         end
 
-        in__[i1+=1] = i2, i3
-
-        po_[i1] = make_hamming_distance(s1, s2)
+        in__[i1+=1] = (Int(ids[i2]), Int(ids[i3]))
+        po_[i1]     = make_hamming_distance(s1, s2)
 
     end
 
-    resize!(in__, i1), resize!(po_, i1)
+    resize!(in__, i1)
+    resize!(po_,  i1)
 
+    return in__, po_
 end
+
 
 # =============================================================================================== #
 # Motif
@@ -476,12 +477,13 @@ end
 #_________#
 
 # takes list of cdrs and checks for a motif, making pairs
-function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
+function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::AbstractString, ids)
+
     u1 = lastindex(st_)
     u2 = div(u1 * (u1 - 1), 2)
 
     in__ = Vector{Tuple{Int,Int}}(undef, u2)
-    po_ = Vector{Int}(undef, u2)
+    po_  = Vector{Int}(undef, u2)
 
     i1 = 0
 
@@ -501,33 +503,27 @@ function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::Abstract
         has2 = false
 
         if booler === nothing
-
             has1 = occursin(motif, core1)
             has2 = occursin(motif, core2)
 
         else
-
-        has1 = occursin(booler, core1)
+            has1 = occursin(booler, core1)
             has2 = occursin(booler, core2)
 
         end
 
-
         if has1 && has2
             i1 += 1
-            in__[i1] = (i2, i3)
-            po_[i1] = 1
+            in__[i1] = (Int(ids[i2]), Int(ids[i3]))   # <-- only change
+            po_[i1]  = 1
         end
-
     end
 
     resize!(in__, i1)
-    resize!(po_, i1)
+    resize!(po_,  i1)
 
     return in__, po_
-
 end
-
 
 function make_motif_pairs_new(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
     u1 = lastindex(st_)
@@ -612,6 +608,7 @@ function make_vertices!(g, cdrs)
     for row in 1:nrow(cdrs)
 
         label = String(cdrs.cdr3[row])
+
         add_vertex!(g, label, Dict(:index => row)) # add vertex
 
         # check for vgenes, etc. and store if they exist
@@ -643,6 +640,54 @@ function make_vertices!(g, cdrs)
 
 end
 
+function make_vertices_indexed!(g, cdrs)
+    isblank(x) = x === nothing || x === missing || x in ("None", "none", "NA", "na", "Na", " ", "  ", "")
+
+    if :row_index ∉ names(cdrs) # make sure rows are indexed
+        cdrs.row_index = collect(1:nrow(cdrs))
+    end
+
+    for row in 1:nrow(cdrs)
+
+        label = Int(cdrs.row_index[row])
+        cdr3_aa = String(cdrs.cdr3[row])
+
+        if !has_vertex(g, label)
+            add_vertex!(g, label, Dict(:cdr3 => cdr3_aa))
+        end
+
+        # check for vgenes, etc. and store if they exist
+        if !isblank(cdrs.vgene[row])
+            g[label][:vgene] = cdrs.vgene[row]
+        end
+
+        try
+            if !isblank(cdrs.jgene[row])
+                g[label][:jgene] = cdrs.jgene[row]
+            end
+        catch
+        end
+
+        try
+            if !isblank(cdrs.dgene[row])
+                g[label][:dgene] = cdrs.dgene[row]
+            end
+        catch
+        end
+
+        try
+            if !isblank(cdrs.donor[row])
+                g[label][:donor] = cdrs.donor[row]
+            end
+        catch
+        end
+
+    end
+
+    return g # return graph
+
+end
+
 # make a global edge w/ annotation of hamming disrance
 function add_global_edge!(g, u, v, distance)
     add_edge!(g, u, v, Dict(:distance => distance))
@@ -659,47 +704,45 @@ end
 # initialises the graph and makes edges
 function make_edges(cdrs, motifs, isglobal, islocal)
 
-    cdr3_vec = String.(cdrs.cdr3)
+    cdrs.cdr3 = String.(cdrs.cdr3) # ensure is string
 
     g = MetaGraph(
         Graph();
-        label_type=String,
-        vertex_data_type=Dict{Symbol,Any},  # test storing multiple labels?
+        label_type=Int,
+        vertex_data_type=Dict{Symbol,Any},
         edge_data_type=Dict{Symbol,Any},
     )
 
     g = make_vertices!(g, cdrs)
 
-    # # changed so label is cdr3
     if isglobal == true
-        pairs, dists = make_distance(cdr3_vec)
 
-            @showprogress desc = "Making edges..." for (index, (i, j)) in enumerate(pairs)
-                d = dists[index]
-                if d <= 1
-                    # i, j are indices into cdr3_vec
-                    u = cdr3_vec[i]
-                    v = cdr3_vec[j]
+        pairs, dists = make_distance(cdrs.cdr3, cdrs.row_index)
 
-                    if haskey(g, u, v)
-                        g[u, v][:distance] = d
-                    else
-                        add_global_edge!(g, u, v, d)
-                    end
-                end
+        @showprogress desc = "Making edges..." for (index, (u, v)) in enumerate(pairs)
+
+            d = dists[index]
+            d <= 1 || continue
+
+            if haskey(g, u, v)
+                g[u, v][:distance] = d
+
+            else
+                add_global_edge!(g, u, v, d)
+
             end
+        end
+
     end
 
-    # TODO: next do local edges
+
     if islocal == true
 
        @showprogress desc = "Making edges..." for (motif, pval) in motifs
 
-           pairs, _ = make_motif_pairs(cdr3_vec, motif)
+           pairs, _ = make_motif_pairs(cdrs.cdr3, motif, cdrs.row_index)
 
-            for (i, j) in pairs
-                u = cdr3_vec[i]
-                v = cdr3_vec[j]
+           for (u, v) in pairs
 
                 if haskey(g, u, v)
 
@@ -781,18 +824,16 @@ function find_length_pvals(g, cdrs2, sim_depth)
 
 end
 
-function score_lengths(g, cdrs2)
+function score_lengths(g, cdrs2) # adds length scores to the graph
 
     clusters = connected_components(g)
-
     p_vals = find_length_pvals(g, cdrs2)
 
     for (index, cluster) in enumerate(clusters)
 
-        labels = label_for.(Ref(g), cluster)
-
-        for label in labels
-            g[label][:length_pval] = p_vals[index] # adding cluster pval to each vertex
+        for vertex in cluster
+            lbl = label_for(g, vertex)
+            g[lbl][:length_pval] = p_vals[index]
         end
 
     end
@@ -800,6 +841,7 @@ function score_lengths(g, cdrs2)
     return p_vals
 
 end
+
 
 #_______________#
 
@@ -817,12 +859,19 @@ function score_vgene(g, sim_depth)
     sizes = Vector{Int}(undef, length(clusters))
 
     for (index, cluster) in enumerate(clusters)
+
         di = Dict{String,Int}()
         sizes[index] = length(cluster)
+
         for vertex in cluster
-            vgene = g[label_for(g, vertex)][:vgene] # should be fixed now!
+
+            lbl = label_for(g, vertex) # uses indices now
+            haskey(g[lbl], :vgene) || continue
+            vgene = g[lbl][:vgene]
+
             di[vgene] = get!(di, vgene, 0) + 1
             totals[vgene] = get!(totals, vgene, 0) + 1
+
         end
         counts[index] = di
     end
@@ -836,8 +885,6 @@ function score_vgene(g, sim_depth)
         p_vals = Dict{String,Float64}()
 
         if sizes[index] <= 200 # for less than 200 in a cluster
-
-            # TO DO = verify if below is correct
 
             for (vgene, count_) in di
                 distribution = Hypergeometric(totals[vgene], sum(sizes) - totals[vgene], sizes[index])
@@ -886,10 +933,9 @@ function score_vgene(g, sim_depth)
     # add cluster vgene pvals to graph
     for (index, cluster) in enumerate(clusters)
 
-        labels = label_for.(Ref(g), cluster)
-
-        for label in labels
-            g[label][:vgene_pval] = cluster_pvals[index] # adding cluster pval to each vertex
+        for vertex in cluster
+            lbl = label_for(g, vertex)
+            g[lbl][:vgene_pval] = cluster_pvals[index]
         end
 
     end
@@ -1001,12 +1047,14 @@ end
 using Graphs
 
 function motif_scoring(g)
+
     clusters = connected_components(g)
     cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
 
     for (index, cluster) in enumerate(clusters)
+
         in_cluster = falses(nv(g))
-        in_cluster[cluster] .= true # find cluster members
+        in_cluster[cluster] .= true
 
         pairs = Tuple{String,Float64}[]
 
@@ -1014,18 +1062,17 @@ function motif_scoring(g)
 
             for v in neighbors(g, u)
 
-                if in_cluster[v] && u < v   # avoid double counting
+                if in_cluster[v] && u < v
 
-                    lu = label_for(g, u)   # <-- ADD
-                    lv = label_for(g, v)   # <-- ADD
+                    lu = label_for(g, u)
+                    lv = label_for(g, v)
 
-                    if haskey(g[lu, lv], :motifs) && haskey(g[lu, lv], :motif_pvals)  # <-- EDIT
+                    if haskey(g, lu, lv) && haskey(g[lu, lv], :motifs) && haskey(g[lu, lv], :motif_pvals)
 
-                        motifs = g[lu, lv][:motifs]      # <-- EDIT
-                        pvals  = g[lu, lv][:motif_pvals] # <-- EDIT
+                        motifs = g[lu, lv][:motifs]
+                        pvals  = g[lu, lv][:motif_pvals]
 
-                        for ind in eachindex(motifs) # store paired motif and pval
-
+                        for ind in eachindex(motifs)
                             push!(pairs, (motifs[ind], pvals[ind]))
 
                         end
@@ -1033,7 +1080,6 @@ function motif_scoring(g)
                     end
                 end
             end
-
         end
 
         cluster_motifs[index] = pairs
@@ -1041,9 +1087,8 @@ function motif_scoring(g)
     end
 
     return cluster_motifs
+
 end
-
-
 
 
 # =============================================================================================== #
@@ -1082,16 +1127,25 @@ function summarize_data(g, vgene_pvals, length_pvals, cluster_motifs)
 
     # get cluster sizes and no. donors
     for (index, cluster) in enumerate(clusters)
-        donors = Vector{String}(undef, nv(g))          # <-- EDIT (was Vector{String}())
+
         cluster_sizes[index] = length(cluster)
 
+        donors = String[]
+
         for vertex in cluster
+
             lbl = label_for(g, vertex)
-            donor = haskey(g[lbl], :donor) ? String(g[lbl][:donor]) : ""   # <-- EDIT (safe)
-            donors[vertex] = donor
+
+            if haskey(g[lbl], :donor)
+
+                d = g[lbl][:donor]
+                d === missing && continue
+                push!(donors, String(d))
+
+            end
         end
 
-        donor_sizes[index] = length(unique(filter(!isempty, donors[cluster])))  # <-- EDIT (count only cluster)
+        donor_sizes[index] = length(unique(donors))
     end
 
     # get v-genes
@@ -1144,31 +1198,32 @@ function extract_clusters_table(g)
 
     for (group_id, cluster) in enumerate(clusters)
         for v in cluster
-            lbl = label_for(g, v)  # this is your CDR3 string label
+            lbl = label_for(g, v)  # row_index label (your vertex label)
 
+            cdr3  = haskey(g[lbl], :cdr3)  ? String(g[lbl][:cdr3])  : ""
             vgene = haskey(g[lbl], :vgene) ? String(g[lbl][:vgene]) : ""
             jgene = haskey(g[lbl], :jgene) ? String(g[lbl][:jgene]) : ""
             dgene = haskey(g[lbl], :dgene) ? String(g[lbl][:dgene]) : ""
             donor = haskey(g[lbl], :donor) ? String(g[lbl][:donor]) : ""
 
             push!(rows, (
-                group = group_id,
-                vertex = v,
-                cdr3 = String(lbl),
-                donor = donor,
-                vgene = vgene,
-                jgene = jgene,
-                dgene = dgene,
+                group  = group_id,
+                vertex_id = v,
+                row_index  = lbl,
+                cdr3   = cdr3,
+                donor  = donor,
+                vgene  = vgene,
+                jgene  = jgene,
+                dgene  = dgene,
             ))
         end
     end
 
     members = DataFrame(rows)
 
-    # simple per-group summary derived from members
     summary = combine(groupby(members, :group),
         nrow => :no_member,
-        :cdr3 => (x -> length(unique(x))) => :no_unique_cdr3,
+        :cdr3  => (x -> length(unique(x))) => :no_unique_cdr3,
         :donor => (x -> length(unique(filter(!isempty, x)))) => :no_donor,
         :vgene => (x -> length(unique(filter(!isempty, x)))) => :no_vgene,
     )
