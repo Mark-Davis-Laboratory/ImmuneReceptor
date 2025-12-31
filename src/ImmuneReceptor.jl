@@ -17,9 +17,10 @@ using Nucleus
 # -> add a way to check for index / window overlap ✅
 # -> add implementation of blosum function in the make edges
 # -> combine blosum functions into one ✅
-# -> create function to make like a nice summary file
+# -> create function to make like a nice summary file ✅
 # -> implement fisher's exact test for cluster significance
 # -> edit scoring functions to either consistently use vector of dictionary or tuple
+# -> structure every scoring function to have basically the same structured output so there can be one function to read them all
 
 # =============================================================================================== #
 # Reading
@@ -57,6 +58,30 @@ function load_cdr3s(csvpath)
 
     filtered_df_2 = transform(groupby(filtered_df, :cdr3), nrow => :duplicate_count)
     return filtered_df_2
+end
+
+function load_cdr3s2(csvpath)
+    df = CSV.read(csvpath, DataFrame)
+    cdr3_keep  = .!(df.cdr3 .∈ Ref(["None", "none", "NA", "na", " "]))
+    c_check = startswith.(df.cdr3, "C")
+    f_check = endswith.(df.cdr3, "F")
+
+    mask = c_check .& cdr3_keep .& f_check
+
+    filtered_df = df[mask, :]
+
+    filtered_df_2 = transform(groupby(filtered_df, :cdr3), nrow => :duplicate_count)
+    return filtered_df_2
+end
+
+function load_cdr3_fasta(path::AbstractString)
+    cdr3s = String[]
+    open(FASTA.Reader, path) do reader
+        for record in reader
+            push!(cdr3s, String(sequence(record)))
+        end
+    end
+    return cdr3s
 end
 
 # =============================================================================================== #
@@ -253,11 +278,31 @@ function get_motif_counts(
     cdrs::AbstractVector{<:AbstractString},
 )
 
-    motif_counts = Dict{String,Int}()
+    motif_counts = Dict{String,Int}(m => 0 for m in motif)
 
-    for m in motif
+    cdrs = unique(cdrs)
 
-        motif_counts[m] = count(cdr -> occursin(m, cdr), cdrs) # count occurances per cdr3 for each motif
+    for cdr in cdrs
+
+        core = cdr[4:(end-3)]
+
+        for m in motif
+
+            if occursin('.', m)
+
+                hit = occursin(Regex(m), core)
+
+            else
+
+                hit = occursin(m, core)
+
+            end
+
+            if hit
+                motif_counts[m] += 1
+            end
+
+        end
 
     end
 
@@ -266,15 +311,19 @@ function get_motif_counts(
 end
 
 # makes list of motifs in cdr3s, counts them, filters based on a cutoff, then provides set count
-function get_motifs(st_::AbstractVector{<:AbstractString}, min::Int, max::Int)
+function get_motifs(st_::AbstractVector{<:AbstractString}, min::Int, max::Int, discontiguous = false)
 
     mo_ = Dict{String,Int}() # make dictionary
+
+    st_ = unique(st_)
 
     @showprogress desc = "Finding and counting motifs..." for s1 in st_
 
         lastindex(s1) < 7 && continue # only keep cdr3 7 or longer
 
         s2 = s1[4:(end-3)] # remove first and last 3 aa
+        lind = lastindex(s2)
+
         for um in min:max
 
             um > lastindex(s2) && continue # make sure cdr3 is longer than the motif size
@@ -282,19 +331,38 @@ function get_motifs(st_::AbstractVector{<:AbstractString}, min::Int, max::Int)
             i1 = 0
             i2 = i1 + um - 1
 
-            while i2 < lastindex(s2)
+            for i1 in 1:(lind - um + 1)
 
-                m = s2[(i1+=1):(i2+=1)] # get the motif
-                mo_[m] = get!(mo_, m, 0) + 1 # count total motif occurances
+                i2 = i1 + um - 1
+
+                m = s2[i1:i2]
+
+                mo_[m] = get!(mo_, m, 0) + 1
 
             end
 
         end
 
+        if discontiguous == true
+            for span in (4, 5)
+
+                lastindex(s2) < span && continue
+
+                for i in 1:(lastindex(s2) - span + 1)
+                    w = s2[i:i+span-1]
+                    for g in 2:(span-1)
+                        p = string(w[1:g-1], ".", w[g+1:end])
+                        mo_[p] = get!(mo_, p, 0) + 1
+                    end
+                end
+            end
+        end
+
     end
 
-    mo_ = Dict(m => num for (m, num) in mo_ if num >= 3) # cutoff of 3
     mo2_ = get_motif_counts(collect(keys(mo_)), st_)
+    mo2_ = Dict(m => num for (m, num) in mo2_ if num >= 3)
+
     return mo2_
 
 end
@@ -307,17 +375,52 @@ function find_significant_motifs(motifs, cdrs1, cdrs2, nsim, ove_cutoff)
     L = length(motifs_list)
     counts_orig = [motifs[m] for m in motifs_list]
 
-    counts_sim = Array{Float64}(undef, nsim, length(motifs_list))
+    counts_sim = Array{Int32}(undef, nsim, L)
+
+    # decide whether to use regex or not
+    booler = Vector{Union{Nothing,Regex}}(undef, L)
+
+    for j in 1:L
+
+        m = motifs_list[j]
+
+        if occursin('.', m)
+            booler[j] = Regex(m)
+
+        else
+            booler[j] = nothing
+
+        end
+    end
 
     significant_motifs = Dict{String,Float64}()
 
+    cores2 = [c[4:(end-3)] for c in cdrs2 if lastindex(c) >= 7]
+    cores2 = unique(cores2)
+
     @showprogress desc = "Calculating significant motifs..." for i in 1:nsim
 
-        random_cdrs = sample(cdrs2, length(cdrs1); replace=true, ordered=false)
-        random_counts = get_motif_counts(motifs_list, random_cdrs)
-        for j in 1:L
-            counts_sim[i, j] = get(random_counts, motifs_list[j], 0)
+        countz = zeros(Int, L)
+
+        random_cdr_cores = sample(cores2, length(cdrs1); replace=true, ordered=false)
+
+        for cdr in random_cdr_cores
+
+            for j in 1:L
+                    if booler[j] === nothing
+                        hit = occursin(motifs_list[j], cdr)
+                    else
+                        hit = occursin(booler[j], cdr)
+                    end
+
+                    if hit
+                        countz[j] += 1
+                    end
+                end
+
         end
+
+        counts_sim[i, :] = countz
 
     end
 
@@ -326,30 +429,38 @@ function find_significant_motifs(motifs, cdrs1, cdrs2, nsim, ove_cutoff)
     for (index, m) in enumerate(motifs_list)
 
         if ove_cutoff == true
-            ove = counts_orig[index] / mean(counts_sim[:, index])
 
-            if counts_orig[index] < 2
+            obs = counts_orig[index]
+            mean_sim = mean(@view counts_sim[:, index])
+
+            # turboGLIPH-style: if expected is 0, set OVE tiny (not Inf)
+            if mean_sim > 0
+                ove = obs / mean_sim
+            else
+                ove = 1e-12
+            end
+
+            if obs < 2
                 continue
 
-            elseif (counts_orig[index] == 2 && ove >= 1000) ||
-                (counts_orig[index] == 3 && ove >= 100) ||
-                (counts_orig[index] >= 4 && ove >= 10)
+            elseif (obs == 2 && ove >= 1000) ||
+                   (obs == 3 && ove >= 100)  ||
+                   (obs >= 4 && ove >= 10)
 
-                wins = count(x -> x >= counts_orig[index], counts_sim[:, index])
+                wins = count(x -> x >= obs, @view counts_sim[:, index])
                 p_val = (wins + 1) / (nsim + 1)
-                #print(p_val)
-                if p_val <= 0.05
+
+                if p_val <= 0.01
                     significant_motifs[m] = get!(significant_motifs, m, 0.0) + p_val
                 end
-
             end
         end
 
         if ove_cutoff != true
             wins = count(x -> x >= counts_orig[index], counts_sim[:, index])
-            p_val = (wins) / (nsim)
+            p_val = (wins + 1) / (nsim + 1)
             print(p_val)
-            if p_val <= 0.05
+            if p_val <= 0.01
                 significant_motifs[m] = get!(significant_motifs, m, 0.0) + p_val
             end
         end
@@ -365,7 +476,7 @@ end
 #_________#
 
 # takes list of cdrs and checks for a motif, making pairs
-function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif)
+function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
     u1 = lastindex(st_)
     u2 = div(u1 * (u1 - 1), 2)
 
@@ -374,51 +485,107 @@ function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif)
 
     i1 = 0
 
-    for i2 in 1:u1, i3 in (i2+1):u1
-        s1, s2 = st_[i2], st_[i3]
+    booler = nothing
 
-        has1 = occursin(motif, s1)
-        has2 = occursin(motif, s2)
+    if occursin('.', motif)
+        booler = Regex(motif)
+    end
+
+    for i2 in 1:u1, i3 in (i2+1):u1
+
+        s1, s2 = st_[i2], st_[i3]
+        core1 = lastindex(s1) < 7 ? "" : s1[4:(end-3)]
+        core2 = lastindex(s2) < 7 ? "" : s2[4:(end-3)]
+
+        has1 = false
+        has2 = false
+
+        if booler === nothing
+
+            has1 = occursin(motif, core1)
+            has2 = occursin(motif, core2)
+
+        else
+
+        has1 = occursin(booler, core1)
+            has2 = occursin(booler, core2)
+
+        end
+
 
         if has1 && has2
             i1 += 1
             in__[i1] = (i2, i3)
             po_[i1] = 1
         end
+
     end
 
     resize!(in__, i1)
     resize!(po_, i1)
 
     return in__, po_
+
 end
 
-function make_motif_pairs_new(st_::AbstractVector{<:AbstractString}, motif)
+
+function make_motif_pairs_new(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
     u1 = lastindex(st_)
     u2 = div(u1 * (u1 - 1), 2)
-    l = length(motif)
 
     in__ = Vector{Tuple{Int,Int}}(undef, u2)
-    po_ = Vector{Int}(undef, u2)
+    po_  = Vector{Int}(undef, u2)
 
     i1 = 0
 
-    for i2 in 1:u1, i3 in (i2+1):u1
-        s1, s2 = st_[i2], st_[i3]
+    booler = nothing
 
-        has1 = occursin(motif, s1)
-        has2 = occursin(motif, s2)
+    if occursin('.', motif)
+        booler = Regex(motif)
+    end
+
+    for i2 in 1:u1, i3 in (i2+1):u1
+
+        s1, s2 = st_[i2], st_[i3]
+        core1 = lastindex(s1) < 7 ? "" : s1[4:(end-3)]
+        core2 = lastindex(s2) < 7 ? "" : s2[4:(end-3)]
+
+        has1 = false
+        has2 = false
+
+        if booler === nothing
+
+            has1 = occursin(motif, core1)
+            has2 = occursin(motif, core2)
+
+        else
+
+            has1 = occursin(booler, core1)
+            has2 = occursin(booler, core2)
+
+        end
 
         if has1 && has2
 
-            nd1 = findfirst(motif, s1)
-            nd2 = findfirst(motif, s2)
+            nd1 = nothing
+            nd2 = nothing
 
-            a1, a2 = start(nd1), stop(nd1)
-            b1, b2 = start(nd2), stop(nd2)
+            if booler === nothing
+
+                nd1 = findfirst(motif, core1)
+                nd2 = findfirst(motif, core2)
+
+            else
+
+                nd1 = findfirst(booler, core1)
+                nd2 = findfirst(booler, core2)
+
+            end
+
+            a1, a2 = first(nd1), last(nd1)
+            b1, b2 = first(nd2), last(nd2)
 
             if max(a1, b1) ≤ min(a2, b2) + 3
-
                 i1 += 1
                 in__[i1] = (i2, i3)
                 po_[i1] = 1
@@ -431,7 +598,9 @@ function make_motif_pairs_new(st_::AbstractVector{<:AbstractString}, motif)
     resize!(po_, i1)
 
     return in__, po_
+
 end
+
 
 # =============================================================================================== #
 # Graphing
@@ -446,16 +615,22 @@ function make_vertices!(g, cdrs)
         add_vertex!(g, label, Dict(:index => row)) # add vertex
 
         # check for vgenes, etc. and store if they exist
-        if !isblank(cdrs.v_gene[row])
-            g[label][:vgene] = cdrs.v_gene[row]
+        if !isblank(cdrs.vgene[row])
+            g[label][:vgene] = cdrs.vgene[row]
         end
 
-        if !isblank(cdrs.j_gene[row])
-            g[label][:jgene] = cdrs.j_gene[row]
+        try
+            if !isblank(cdrs.jgene[row])
+                g[label][:jgene] = cdrs.jgene[row]
+            end
+        catch
         end
 
-        if !isblank(cdrs.d_gene[row])
-            g[label][:dgene] = cdrs.d_gene[row]
+        try
+            if !isblank(cdrs.dgene[row])
+                g[label][:dgene] = cdrs.dgene[row]
+            end
+        catch
         end
 
         if !isblank(cdrs.donor[row])
@@ -495,7 +670,6 @@ function make_edges(cdrs, motifs, isglobal, islocal)
 
     g = make_vertices!(g, cdrs)
 
-    # start w/ global distances
     # # changed so label is cdr3
     if isglobal == true
         pairs, dists = make_distance(cdr3_vec)
@@ -521,26 +695,31 @@ function make_edges(cdrs, motifs, isglobal, islocal)
 
        @showprogress desc = "Making edges..." for (motif, pval) in motifs
 
-            mask  = occursin.(Ref(motif), cdr3_vec)
-            matches  = findall(mask)
-            nmatches = length(matches)
+           pairs, _ = make_motif_pairs(cdr3_vec, motif)
 
-            # nothing to do if fewer than 2 sequences have this motif
-            if nmatches <= 1
-                continue
-            end
-
-            # all unique pairs of those indices
-            for i in 1:(nmatches-1), j in (i+1):nmatches
-                u = cdr3_vec[matches[i]]
-                v = cdr3_vec[matches[j]]
+            for (i, j) in pairs
+                u = cdr3_vec[i]
+                v = cdr3_vec[j]
 
                 if haskey(g, u, v)
+
+                    if !haskey(g[u, v], :motifs)
+                        g[u, v][:motifs] = String[]
+
+                    end
+
+                    if !haskey(g[u, v], :motif_pvals)
+                        g[u, v][:motif_pvals] = Float64[]
+                    end
+
                     push!(g[u, v][:motifs], motif)
                     push!(g[u, v][:motif_pvals], pval)
+
                 else
                     add_local_edge!(g, u, v, motif, pval)
                 end
+
+
             end
         end
     end # end of local edges
@@ -821,7 +1000,7 @@ end
 
 using Graphs
 
-function collect_cluster_motifs(g)
+function motif_scoring(g)
     clusters = connected_components(g)
     cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
 
@@ -837,12 +1016,13 @@ function collect_cluster_motifs(g)
 
                 if in_cluster[v] && u < v   # avoid double counting
 
-                    if haskey(g[u, v], :motifs) && haskey(g[u, v], :motif_pvals)
+                    lu = label_for(g, u)   # <-- ADD
+                    lv = label_for(g, v)   # <-- ADD
 
-                        motifs = g[u, v][:motifs]
-                        pvals  = g[u, v][:motif_pvals]
+                    if haskey(g[lu, lv], :motifs) && haskey(g[lu, lv], :motif_pvals)  # <-- EDIT
 
-                        @assert length(motifs) == length(pvals)
+                        motifs = g[lu, lv][:motifs]      # <-- EDIT
+                        pvals  = g[lu, lv][:motif_pvals] # <-- EDIT
 
                         for ind in eachindex(motifs) # store paired motif and pval
 
@@ -883,7 +1063,7 @@ end
 # length -> vector of p-vals
 # indexed dictionary with correct p-val of most significant v-gene
 
-function summarize_data(g, vgene_pvals, length_pvals)
+function summarize_data(g, vgene_pvals, length_pvals, cluster_motifs)
 
     # get cluster sizes
 
@@ -902,37 +1082,96 @@ function summarize_data(g, vgene_pvals, length_pvals)
 
     # get cluster sizes and no. donors
     for (index, cluster) in enumerate(clusters)
-        donors = Vector{String}()
+        donors = Vector{String}(undef, nv(g))          # <-- EDIT (was Vector{String}())
         cluster_sizes[index] = length(cluster)
 
         for vertex in cluster
-            donor = g[label_for(g, vertex)][:donor] # should be fixed now!
+            lbl = label_for(g, vertex)
+            donor = haskey(g[lbl], :donor) ? String(g[lbl][:donor]) : ""   # <-- EDIT (safe)
             donors[vertex] = donor
         end
 
-        donor_sizes[index] = length(unique(donors))
-
+        donor_sizes[index] = length(unique(filter(!isempty, donors[cluster])))  # <-- EDIT (count only cluster)
     end
 
+    # get v-genes
     vgenes = [first(keys(i)) for i in vgene_pvals]
     v_pvals  = [first(values(i)) for i in vgene_pvals]
 
+    # get motifs
+    top_motifs = Tuple{String,Float64}[]
+
+    for pairs in cluster_motifs
+        if isempty(pairs)
+
+            push!(top_motifs, ("", NaN))
+
+        else
+
+            pvals = last.(pairs)
+            ind = argmin(pvals)
+            push!(top_motifs, pairs[ind])
+
+        end
+
+    end
+
+    motifs = first.(top_motifs)
+    m_pvals  = last.(top_motifs)
+
     df = DataFrame(
-        group = Int64[],
+        group = collect(1:length(clusters)),
         no_member = cluster_sizes,
         no_donor = donor_sizes,
         length_pval = length_pvals,
         vgene_pval = v_pvals,
         vgene = vgenes,
-        motif_pval = Int64[],
-        #motif = String[]
+        motif_pval = m_pvals,
+        motif = motifs
     )
 
+    return df
 
-    # create DataFrame
-    # fill in iteratively with everything
-    #
+end
 
+using Graphs
+using DataFrames
 
+function extract_clusters_table(g)
+    clusters = connected_components(g)
 
+    rows = NamedTuple[]
+
+    for (group_id, cluster) in enumerate(clusters)
+        for v in cluster
+            lbl = label_for(g, v)  # this is your CDR3 string label
+
+            vgene = haskey(g[lbl], :vgene) ? String(g[lbl][:vgene]) : ""
+            jgene = haskey(g[lbl], :jgene) ? String(g[lbl][:jgene]) : ""
+            dgene = haskey(g[lbl], :dgene) ? String(g[lbl][:dgene]) : ""
+            donor = haskey(g[lbl], :donor) ? String(g[lbl][:donor]) : ""
+
+            push!(rows, (
+                group = group_id,
+                vertex = v,
+                cdr3 = String(lbl),
+                donor = donor,
+                vgene = vgene,
+                jgene = jgene,
+                dgene = dgene,
+            ))
+        end
+    end
+
+    members = DataFrame(rows)
+
+    # simple per-group summary derived from members
+    summary = combine(groupby(members, :group),
+        nrow => :no_member,
+        :cdr3 => (x -> length(unique(x))) => :no_unique_cdr3,
+        :donor => (x -> length(unique(filter(!isempty, x)))) => :no_donor,
+        :vgene => (x -> length(unique(filter(!isempty, x)))) => :no_vgene,
+    )
+
+    return (members = members, summary = summary)
 end
