@@ -24,17 +24,19 @@ using Nucleus
 
 # loading data
 reference_cdrs = load_cdr3_fasta("in/gliph1/gliph/db/warren-naive.fa")
-df = load_cdr3s("in/gliph1/gliph/db/owo_test.csv")
+reference_cdrs = load_cdr3_fasta("in/gliph1/gliph/db/warren-naive.fa")
+
+df = load_cdr3s("in/gliph1/gliph/db/test_data_originalgliph.csv")
 #hla_df = CSV.read(/path/to/your/hla_data.csv, DataFrame) # if choosing to analyse hla also
 
 # find motifs
 #all_motifs = get_motifs(cd.cdr3, min_length, max_length)
 all_motifs = get_motifs(df.cdr3, 3, 5)
 #sig_motifs = find_significant_motifs(all_motifs, sample_cdrs, reference_cdrs, nsim, ove_cutoff)
-sig_motifs = find_significant_motifs(all_motifs, df.cdr3, reference_cdrs)
+sig_motifs = find_significant_motifs(all_motifs, df.cdr3, reference_cdrs, 1000, true)
 
 # make graph
-graph = make_edges(df, sig_motifs, isglobal = true, islocal = true)
+graph = make_edges(df, sig_motifs, true, true)
 
 # score
 length_pvals = find_length_pvals(graph, reference_cdrs, sim_depth)

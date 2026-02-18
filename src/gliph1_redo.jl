@@ -21,9 +21,6 @@ using Nucleus
 # -> implement fisher's exact test for cluster significance
 # -> edit scoring functions to either consistently use vector of dictionary or tuple
 # -> structure every scoring function to have basically the same structured output so there can be one function to read them all
-# -> get overall cluster scoring working
-# -> change so data is stored as named tuples or a dictionary maybe?
-#
 
 # =============================================================================================== #
 # Reading
@@ -47,45 +44,34 @@ function is_cdr3(st)
 
 end
 
-using CSV, DataFrames
-
-# new, deduplicates
-function load_cdr3s2(csvpath)
-
+function load_cdr3s(csvpath)
     df = CSV.read(csvpath, DataFrame)
+    chain_keep_a = df.chain .∈ Ref(["TRG", "TRD", "TRA", "TRB"])
+    chain_keep_b = .!(df.chain .∈ Ref(["None", "none", "NA", "na", " ", "Multi"]))
+    cdr3_keep  = .!(df.cdr3 .∈ Ref(["None", "none", "NA", "na", " "]))
+    c_check = startswith.(df.cdr3, "C")
+    f_check = endswith.(df.cdr3, "F")
 
-    cdr3 = String.(coalesce.(df.cdr3, ""))
-    cdr3 = replace.(cdr3, r"\s+" => "")
-    cdr3 = uppercase.(cdr3)
+    mask = c_check .& chain_keep_a .& chain_keep_b .& cdr3_keep .& f_check
 
-    bad = Set(["", "NA", "NONE", "NAN", "NULL"])
-    keep = .!(cdr3 .∈ Ref(bad))
-    keep .&= startswith.(cdr3, "C")
-    keep .&= endswith.(cdr3, "F")
+    filtered_df = df[mask, :]
 
-    df = df[keep, :]
-    df.cdr3 = cdr3[keep]
-    df.cdr3_length = length.(df.cdr3)
+    filtered_df_2 = transform(groupby(filtered_df, :cdr3), nrow => :duplicate_count)
+    return filtered_df_2
+end
 
-    has_barcode = ("barcode" in names(df))
-    has_sample  = ("sample"  in names(df))
+function load_cdr3s2(csvpath)
+    df = CSV.read(csvpath, DataFrame)
+    cdr3_keep  = .!(df.cdr3 .∈ Ref(["None", "none", "NA", "na", " "]))
+    c_check = startswith.(df.cdr3, "C")
+    f_check = endswith.(df.cdr3, "F")
 
-    new = groupby(df, :cdr3)
+    mask = c_check .& cdr3_keep .& f_check
 
-    new_cols = Any[nrow => :duplicate_count, :cdr3_length => first => :cdr3_length]
+    filtered_df = df[mask, :]
 
-    if "barcode" in names(df)
-        push!(new_cols, :barcode => (x -> collect(unique(x))) => :barcodes)
-    end
-
-    if "sample" in names(df)
-        push!(new_cols, :sample => (x -> collect(unique(x))) => :samples)
-    end
-
-    out = combine(new, new_cols...)
-
-    return out
-
+    filtered_df_2 = transform(groupby(filtered_df, :cdr3), nrow => :duplicate_count)
+    return filtered_df_2
 end
 
 function load_cdr3_fasta(path::AbstractString)
@@ -232,10 +218,8 @@ function make_blosum_score(s1, s2)
         end
     end
 
-    if isempty(mismatch_indices)
-        return 0
-    elseif length(mismatch_indices) > 1
-        return -Inf
+    if isempty(mismatch_indices) || length(mismatch_indices) > 1
+            return length(mismatch_indices)
     end
 
     nd = mismatch_indices[1]
@@ -243,10 +227,11 @@ function make_blosum_score(s1, s2)
     a1 = s1[nd]
     a2 = s2[nd]
 
-    return get(blosum62, (a1, a2), get(blosum62, (a2, a1), -Inf))
+    scores = blosum62[(a1,a2)], blosum62[(a2,a1)]
+
+    return min(scores)
 
 end
-
 
 function make_distance(st_, ids)
 
@@ -289,7 +274,10 @@ end
 
 # count whether motif is present at least once per cdr3 for all cdr3s
 
-function get_motif_counts(motif::AbstractVector{<:AbstractString}, cdrs::AbstractVector{<:AbstractString},)
+function get_motif_counts(
+    motif::AbstractVector{<:AbstractString},
+    cdrs::AbstractVector{<:AbstractString},
+)
 
     motif_counts = Dict{String,Int}(m => 0 for m in motif)
 
@@ -389,112 +377,120 @@ function get_motifs(st_::AbstractVector{<:AbstractString}, min::Int, max::Int, d
 
 end
 
-using Statistics
-using HypothesisTests
+function find_significant_motifs(motifs, cdrs1, cdrs2, nsim, ove_cutoff)
 
-function find_significant_motifs(
-    motifs, cdrs1, cdrs2;
-    pvalue_cutoff::Float64 = 0.01,
-    min_fold = (1000.0, 100.0, 10.0),
-    fold_lengths = (2, 3, 4),
-    min_count::Int = 3,
-    use_fold_cutoff::Bool = true,
-    pseudocount::Float64 = 0.01,
-)
+    Random.seed!(3)
 
     motifs_list = collect(keys(motifs))
     L = length(motifs_list)
+    counts_orig = [motifs[m] for m in motifs_list]
 
-    pat = Vector{Union{Nothing,Regex}}(undef, L)
+    counts_sim = Array{Int32}(undef, nsim, L)
+
+    # decide whether to use regex or not
+    booler = Vector{Union{Nothing,Regex}}(undef, L)
+
     for j in 1:L
+
         m = motifs_list[j]
-        pat[j] = occursin('.', m) ? Regex(m) : nothing
+
+        if occursin('.', m)
+            booler[j] = Regex(m)
+
+        else
+            booler[j] = nothing
+
+        end
     end
 
-    cdrs1 = unique(cdrs1)
+    significant_motifs = Dict{String,Float64}()
+
     cdrs2 = unique(cdrs2)
+    cdrs1 = unique(cdrs1)
 
-    cores1 = unique([c[4:(end-3)] for c in cdrs1 if lastindex(c) >= 7])
-    cores2 = unique([c[4:(end-3)] for c in cdrs2 if lastindex(c) >= 7])
+    cores2 = [c[4:(end-3)] for c in cdrs2 if lastindex(c) >= 7]
+    cores2 = unique(cores2)
 
-    n1 = length(cores1)  # sample unique
-    n2 = length(cores2)  # reference unique
+    @showprogress desc = "Calculating significant motifs..." for i in 1:nsim
 
-    # no data => no motifs
-    if n1 == 0 || n2 == 0 || L == 0
-        return Dict{String,Float64}()
+        countz = zeros(Int, L)
+
+        random_cdr_cores = sample(cores2, length(cdrs1); replace=true, ordered=false)
+
+        for cdr in random_cdr_cores
+
+            for j in 1:L
+                    if booler[j] === nothing
+                        hit = occursin(motifs_list[j], cdr)
+                    else
+                        hit = occursin(booler[j], cdr)
+                    end
+
+                    if hit
+                        countz[j] += 1
+                    end
+                end
+
+        end
+
+        counts_sim[i, :] = countz
+
     end
 
-    # per-motif fold threshold (GLIPH2: depends on motif length; discontinuous motifs count as length-1)
-    minfold_for = Vector{Float64}(undef, L)
-    if length(min_fold) == 1
-        fill!(minfold_for, float(min_fold))
-    else
+    # everything above this line works
 
-        @assert length(min_fold) == length(fold_lengths)
+    for (index, m) in enumerate(motifs_list)
 
-        for j in 1:L
-            m = motifs_list[j]
-            eff_len = length(m) - (occursin('.', m) ? 1 : 0)
+        if ove_cutoff == true
 
-            thr = 0.0
-            for (k, Lk) in pairs(fold_lengths)
-                if eff_len == Lk
-                    thr = float(min_fold[k])
-                    break
-                end
+            obs = counts_orig[index]
+            mean_sim = mean(@view counts_sim[:, index])
+
+            # turboGLIPH-style: if expected is 0, set OVE tiny (not Inf)
+            if mean_sim > 0
+                ove = obs / mean_sim
+            else
+                ove = 1e-12
             end
 
-            # if it doesn't match any provided fold_lengths, set to 0 (i.e., don't filter by fold)
-            minfold_for[j] = thr
+            if obs < 2
+                continue
 
-        end
-    end
+            elseif (obs == 2 && ove >= 1000) ||
+                   (obs == 3 && ove >= 100)  ||
+                   (obs >= 4 && ove >= 10)
 
-    significant = Dict{String,Float64}()
+                wins = count(x -> x >= obs, @view counts_sim[:, index])
+                p_val = (wins + 1) / (nsim + 1)
 
-    for j in 1:L
-        m = motifs_list[j]
-
-        a = 0
-        for c in cores1
-            hit = pat[j] === nothing ? occursin(m, c) : occursin(pat[j], c)
-            a += hit ? 1 : 0
-        end
-
-        c = 0
-        for cdr in cores2
-            hit = pat[j] === nothing ? occursin(m, cdr) : occursin(pat[j], cdr)
-            c += hit ? 1 : 0
+                if p_val <= 0.001
+                    significant_motifs[m] = get!(significant_motifs, m, 0.0) + p_val
+                end
+            end
         end
 
-        a < min_count && continue
-
-        b = n1 - a
-        d = n2 - c
-
-        ove = (a / n1) / ((c + pseudocount) / n2)
-
-        if use_fold_cutoff
-            ove >= minfold_for[j] || continue
+        if ove_cutoff != true
+            wins = count(x -> x >= counts_orig[index], counts_sim[:, index])
+            p_val = (wins + 1) / (nsim + 1)
+            print(p_val)
+            if p_val <= 0.001
+                significant_motifs[m] = get!(significant_motifs, m, 0.0) + p_val
+            end
         end
-
-        p = pvalue(FisherExactTest(a, b, c, d); tail = :right)
-        p <= pvalue_cutoff || continue
-
-        significant[m] = p  # raw p-value, like GLIPH2’s “motif enrichment” filtering step
 
     end
 
-    return significant
+    println(string("Number of significant motifs identified:", length(significant_motifs)))
+    return significant_motifs
 
 end
+
 
 #_________#
 
 # takes list of cdrs and checks for a motif, making pairs
+function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::AbstractString, ids)
 
-function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
     u1 = lastindex(st_)
     u2 = div(u1 * (u1 - 1), 2)
 
@@ -521,9 +517,60 @@ function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::Abstract
         if booler === nothing
             has1 = occursin(motif, core1)
             has2 = occursin(motif, core2)
+
         else
             has1 = occursin(booler, core1)
             has2 = occursin(booler, core2)
+
+        end
+
+        if has1 && has2
+            i1 += 1
+            in__[i1] = (Int(ids[i2]), Int(ids[i3]))   # <-- only change
+            po_[i1]  = 1
+        end
+    end
+
+    resize!(in__, i1)
+    resize!(po_,  i1)
+
+    return in__, po_
+end
+
+function make_motif_pairs_new(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
+    u1 = lastindex(st_)
+    u2 = div(u1 * (u1 - 1), 2)
+
+    in__ = Vector{Tuple{Int,Int}}(undef, u2)
+    po_  = Vector{Int}(undef, u2)
+
+    i1 = 0
+
+    booler = nothing
+
+    if occursin('.', motif)
+        booler = Regex(motif)
+    end
+
+    for i2 in 1:u1, i3 in (i2+1):u1
+
+        s1, s2 = st_[i2], st_[i3]
+        core1 = lastindex(s1) < 7 ? "" : s1[4:(end-3)]
+        core2 = lastindex(s2) < 7 ? "" : s2[4:(end-3)]
+
+        has1 = false
+        has2 = false
+
+        if booler === nothing
+
+            has1 = occursin(motif, core1)
+            has2 = occursin(motif, core2)
+
+        else
+
+            has1 = occursin(booler, core1)
+            has2 = occursin(booler, core2)
+
         end
 
         if has1 && has2
@@ -532,31 +579,36 @@ function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::Abstract
             nd2 = nothing
 
             if booler === nothing
+
                 nd1 = findfirst(motif, core1)
                 nd2 = findfirst(motif, core2)
+
             else
+
                 nd1 = findfirst(booler, core1)
                 nd2 = findfirst(booler, core2)
+
             end
 
-            a1 = first(nd1)
-            b1 = first(nd2)
+            a1, a2 = first(nd1), last(nd1)
+            b1, b2 = first(nd2), last(nd2)
 
-            if abs(a1 - b1) ≤ 3
+            if max(a1, b1) ≤ min(a2, b2) + 3
                 i1 += 1
                 in__[i1] = (i2, i3)
                 po_[i1] = 1
+
             end
-
         end
-
     end
 
     resize!(in__, i1)
     resize!(po_, i1)
 
     return in__, po_
+
 end
+
 
 # =============================================================================================== #
 # Graphing
@@ -662,9 +714,6 @@ function add_local_edge!(g, u, v, motif::String, pval)
 end
 
 # initialises the graph and makes edges
-#
-# ADD blosum scoring cutoff
-#
 function make_edges(cdrs, motifs, isglobal, islocal)
 
     cdrs.cdr3 = String.(cdrs.cdr3) # ensure is string
@@ -685,27 +734,17 @@ function make_edges(cdrs, motifs, isglobal, islocal)
         @showprogress desc = "Making edges..." for (index, (u, v)) in enumerate(pairs)
 
             d = dists[index]
+            d <= 1 || continue
 
-            # check distance and calculate blosum score if needed
-            if d == 1
-
-                s1 = cdrs.cdr3[u]
-                s2 = cdrs.cdr3[v]
-
-                make_blosum_score(s1, s2) >= 0 || continue
-
-            else
-                d <= 1 || continue
-            end
-
-            # add edge
             if haskey(g, u, v)
                 g[u, v][:distance] = d
+
             else
                 add_global_edge!(g, u, v, d)
-            end
 
+            end
         end
+
     end
 
 
@@ -756,20 +795,13 @@ end
 
 using StatsBase: mode
 
-using StatsBase, Statistics
-
 function find_length_pvals(g, cdrs2, sim_depth)
-
     clusters = connected_components(g)
 
-    ref_lengths = length.(cdrs2)
-    ref_tab = countmap(ref_lengths)
-    ref_len_vals = collect(keys(ref_tab))
-    ref_probs = [ref_tab[L] for L in ref_len_vals]
-    ref_probs = ref_probs ./ sum(ref_probs)
+    modes = Vector{Int}()
+    props = Vector{Float64}()
 
-    p_vals = Float64[]
-
+    # get most common length for each cluster
     for cluster in clusters
 
         labels = label_for.(Ref(g), cluster)
@@ -777,46 +809,41 @@ function find_length_pvals(g, cdrs2, sim_depth)
         cluster_lengths = Int[]
 
         for lbl in labels
+
             haskey(g[lbl], :cdr3) || continue
             push!(cluster_lengths, length(String(g[lbl][:cdr3])))
+
         end
 
-        n = length(cluster_lengths)
+        m = mode(cluster_lengths)
+        push!(modes, m)
+        push!(props, count(==(m), cluster_lengths) / length(cluster_lengths))
 
-        if n == 0
-            push!(p_vals, 1.0)
-            continue
-        end
+    end
 
-        cl_tab = countmap(cluster_lengths)
-        p_len = [cnt / n for cnt in values(cl_tab)]
-        sample_score = prod(p_len)
+    # randomly pick n sequences from the null distribution and compare to
+    cluster_sizes = [length(cluster) for cluster in clusters]
+    p_vals = Float64[]
 
-        sim_scores = Vector{Float64}(undef, sim_depth)
+    for (index, size) in enumerate(cluster_sizes)
+
+        sim_props = Float64[]
 
         for i in 1:sim_depth
-
-            sim_lengths = sample(ref_len_vals, Weights(ref_probs), n; replace=true)
-            sim_tab = countmap(sim_lengths)
-
-            p_sim = [cnt / n for cnt in values(sim_tab)]
-
-            sim_scores[i] = prod(p_sim)
+            random_cdrs = sample(cdrs2, size; replace=true, ordered=false)
+            cluster_lengths = [length(s) for s in random_cdrs]
+            push!(sim_props, (count(==(modes[index]), cluster_lengths)) / size)
         end
 
-
-        wins = count(>(sample_score), sim_scores)
-        p = wins / sim_depth
-        p = (p == 0.0) ? (1.0 / sim_depth) : p
-
-        push!(p_vals, p)
+        # count number of times sim beats data?
+        p_val = ((count(>=(props[index]), sim_props)) + 1) / (sim_depth + 1)
+        push!(p_vals, p_val)
 
     end
 
     return p_vals
 
 end
-
 
 function score_lengths(g, cdrs2) # adds length scores to the graph
 
@@ -838,71 +865,93 @@ end
 
 
 #_______________#
+
 # v gene score
 # hyper geomtric or parameteric when over 200 sequences in one group
 
 using Distributions
 
-using StatsBase, Statistics
-
 function score_vgene(g, sim_depth)
     clusters = connected_components(g)
 
+    # make vector w/ dictionary of vgenes
     counts = Vector{Dict{String,Int}}(undef, length(clusters))
     totals = Dict{String,Int}()
     sizes = Vector{Int}(undef, length(clusters))
 
     for (index, cluster) in enumerate(clusters)
+
         di = Dict{String,Int}()
         sizes[index] = length(cluster)
 
         for vertex in cluster
-            lbl = label_for(g, vertex)
+
+            lbl = label_for(g, vertex) # uses indices now
             haskey(g[lbl], :vgene) || continue
-            vgene = String(g[lbl][:vgene])
+            vgene = g[lbl][:vgene]
 
             di[vgene] = get!(di, vgene, 0) + 1
             totals[vgene] = get!(totals, vgene, 0) + 1
-        end
 
+        end
         counts[index] = di
     end
 
-    v_keys = collect(keys(totals))
-    v_probs = [totals[v] for v in v_keys]
-    v_probs = v_probs ./ sum(v_probs)
-
+    # actually do p-vals after counting
+    v_all = [g[cdr][:vgene] for cdr in labels(g) if haskey(g[cdr], :vgene)]
     cluster_pvals = Vector{Dict{String,Float64}}(undef, length(clusters))
 
     for (index, di) in enumerate(counts)
-        n = sizes[index]
 
-        if isempty(di) || n == 0
-            cluster_pvals[index] = Dict("NA" => 1.0)
-            continue
-        end
+        p_vals = Dict{String,Float64}()
 
-        p_v = [cnt / n for cnt in values(di)]
-        sample_score = prod(p_v)
+        if sizes[index] <= 200 # for less than 200 in a cluster
 
-        wins = 0
-        for i in 1:sim_depth
-            random_vgenes = sample(v_keys, Weights(v_probs), n; replace=true, ordered=false)
-            sim_tab = countmap(random_vgenes)
-            p_sim = [cnt / n for cnt in values(sim_tab)]
-            sim_score = prod(p_sim)
-
-            if sim_score > sample_score
-                wins += 1
+            for (vgene, count_) in di
+                distribution = Hypergeometric(totals[vgene], sum(sizes) - totals[vgene], sizes[index])
+                p = ccdf(distribution, count_ - 1)
+                p_vals[vgene] = p
             end
+
+        else # for when > 200 in a cluster
+
+            sim_wins = Dict{String,Int}()
+
+            for i in 1:sim_depth # do sim_depth random pulls from the samples and count vgenes
+
+                # sizes[index] has cluster size - stored in earlier loop
+                random_vgenes = sample(v_all, sizes[index]; replace=true, ordered=false)
+
+                # go through every vgene
+                for (vgene, orig_count) in di
+
+                    count_ = count(x -> x == vgene, random_vgenes)
+
+                    if count_ >= orig_count
+                        sim_wins[vgene] = get!(sim_wins, vgene, 0) + 1
+                    else
+                        sim_wins[vgene] = get!(sim_wins, vgene, 0) + 0
+                    end
+
+                end
+
+            end
+
+            # go through sim wins + gen new dictionary
+
+            for (vgene, wins) in sim_wins
+                p = (wins + 1) / (sim_depth + 1)
+                p_vals[vgene] = p
+            end
+
         end
 
-        p = wins / sim_depth
-        p = (p == 0.0) ? (1.0 / sim_depth) : p
+        val, key = findmin(p_vals)   # val = pval (Float64), key = vgene (String)
+        cluster_pvals[index] = Dict(key => (val * length(p_vals)))
 
-        cluster_pvals[index] = Dict("vgene_spectratype_p" => p)
     end
 
+    # add cluster vgene pvals to graph
     for (index, cluster) in enumerate(clusters)
 
         for vertex in cluster
@@ -913,8 +962,8 @@ function score_vgene(g, sim_depth)
     end
 
     return cluster_pvals
-end
 
+end
 
 #_______________#
 
