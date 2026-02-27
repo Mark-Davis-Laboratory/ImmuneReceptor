@@ -798,51 +798,62 @@ using StatsBase: mode
 function find_length_pvals(g, cdrs2, sim_depth)
     clusters = connected_components(g)
 
-    modes = Vector{Int}()
-    props = Vector{Float64}()
+    sample_scores = Float64[]
+    ns = Int[]
 
-    # get most common length for each cluster
+    # get product-of-frequencies score for each cluster
     for cluster in clusters
-
         labels = label_for.(Ref(g), cluster)
 
         cluster_lengths = Int[]
-
         for lbl in labels
-
             haskey(g[lbl], :cdr3) || continue
             push!(cluster_lengths, length(String(g[lbl][:cdr3])))
-
         end
 
-        m = mode(cluster_lengths)
-        push!(modes, m)
-        push!(props, count(==(m), cluster_lengths) / length(cluster_lengths))
+        # skip empty clusters
+        n = length(cluster_lengths)
+        if n == 0
+            push!(sample_scores, 1.0)
+            push!(ns, 0)
+            continue
+        end
 
+        # length frequencies within cluster
+        cl_tab = countmap(cluster_lengths)
+        p_len = [cnt / n for cnt in values(cl_tab)]
+
+        # product of frequencies (GLIPH-style concentration score)
+        sample_score = prod(p_len)
+
+        push!(sample_scores, sample_score)
+        push!(ns, n)
     end
 
-    # randomly pick n sequences from the null distribution and compare to
-    cluster_sizes = [length(cluster) for cluster in clusters]
+    # simulate under null by sampling CDR3s from cdrs2
     p_vals = Float64[]
-
-    for (index, size) in enumerate(cluster_sizes)
-
-        sim_props = Float64[]
-
-        for i in 1:sim_depth
-            random_cdrs = sample(cdrs2, size; replace=true, ordered=false)
-            cluster_lengths = [length(s) for s in random_cdrs]
-            push!(sim_props, (count(==(modes[index]), cluster_lengths)) / size)
+    for (index, n) in enumerate(ns)
+        if n == 0
+            push!(p_vals, 1.0)
+            continue
         end
 
-        # count number of times sim beats data?
-        p_val = ((count(>=(props[index]), sim_props)) + 1) / (sim_depth + 1)
-        push!(p_vals, p_val)
+        sim_scores = Float64[]
+        for i in 1:sim_depth
+            random_cdrs = sample(cdrs2, n; replace=true, ordered=false)
+            sim_lengths = [length(s) for s in random_cdrs]
 
+            sim_tab = countmap(sim_lengths)
+            p_len = [cnt / n for cnt in values(sim_tab)]
+            push!(sim_scores, prod(p_len))
+        end
+
+        # one-sided p-value: how often null is as concentrated or more than observed
+        p_val = (count(>=(sample_scores[index]), sim_scores) + 1) / (sim_depth + 1)
+        push!(p_vals, p_val)
     end
 
     return p_vals
-
 end
 
 function score_lengths(g, cdrs2) # adds length scores to the graph
