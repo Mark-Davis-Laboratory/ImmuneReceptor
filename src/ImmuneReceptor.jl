@@ -8,10 +8,6 @@ const OU = joinpath(PK, "ou")
 
 # ----------------------------------------------------------------------------------------------- #
 
-using ProgressMeter: @showprogress
-
-using Nucleus
-
 using CSV
 using DataFrames
 using ProgressMeter
@@ -19,28 +15,21 @@ using Statistics
 using HypothesisTests
 using StatsBase
 using Distributions
-
 using Random
 using Graphs
 using MetaGraphsNext
 using FASTX
 
-# to do:
-# -> add index tracking to the motif function ✅
-# -> add a way to check for index / window overlap (done + updated) ✅
-# -> add implementation of blosum function in the make edges
-# -> combine blosum functions into one ✅
-# -> create function to make like a nice summary file ✅
-# -> implement fisher's exact test for cluster significance
-# -> edit scoring functions to either consistently use vector of dictionary or tuple
-# -> structure every scoring function to have basically the same structured output so there can be one function to read them all
-# -> get overall cluster scoring working
-# -> change so data is stored as named tuples or a dictionary maybe?
-#
+#################
+### PATHS
+#################
 
-# =============================================================================================== #
-# Reading
-# =============================================================================================== #
+const VGENE_FREQ_PATH = joinpath(IN, "tcrb-human_v-freq.txt")
+const LEN_FREQ_PATH = joinpath(IN, "tcrb-human_cdr3len-freq.txt")
+
+#################
+### READING
+#################
 
 function is_t_gene(::Any)
 
@@ -62,10 +51,11 @@ end
 
 using CSV, DataFrames
 
-# new, deduplicates
-function load_cdr3s2(csvpath)
+function load_cdr3s(csvpath)
 
-    df = CSV.read(csvpath, DataFrame)
+    df = CSV.read(csvpath, DataFrame; delim='\t')
+
+    df[!, :tcr_id] = 1:nrow(df)
 
     cdr3 = String.(coalesce.(df.cdr3, ""))
     cdr3 = replace.(cdr3, r"\s+" => "")
@@ -75,13 +65,13 @@ function load_cdr3s2(csvpath)
     keep = .!(cdr3 .∈ Ref(bad))
     keep .&= startswith.(cdr3, "C")
     keep .&= endswith.(cdr3, "F")
+    keep .&= .!occursin.(r"[^A-Z]", cdr3)
 
     df = df[keep, :]
     df.cdr3 = cdr3[keep]
     df.cdr3_length = length.(df.cdr3)
 
     new = groupby(df, :cdr3)
-
     new_cols = Any[nrow=>:duplicate_count, :cdr3_length=>first=>:cdr3_length]
 
     if "barcode" in names(df)
@@ -95,9 +85,11 @@ function load_cdr3s2(csvpath)
     if "vgene" in names(df)
         push!(new_cols, :vgene => (x -> collect(unique(x))) => :vgenes)
     end
+
     if "jgene" in names(df)
         push!(new_cols, :jgene => (x -> collect(unique(x))) => :jgenes)
     end
+
     if "dgene" in names(df)
         push!(new_cols, :dgene => (x -> collect(unique(x))) => :dgenes)
     end
@@ -114,9 +106,16 @@ function load_cdr3s2(csvpath)
         push!(new_cols, :umis => sum => :clones_sum)
     end
 
+    if "tcr_id" in names(df)
+        df.tcr_id = Int.(coalesce.(df.tcr_id, 0))
+        push!(new_cols, :tcr_id => (x -> collect(x)) => :tcr_ids)
+        push!(new_cols, :tcr_id => sum => :tcr_ids)
+    end
+
     out = combine(new, new_cols...)
 
     return out
+
 end
 
 function load_cdr3_fasta(path::AbstractString)
@@ -129,49 +128,11 @@ function load_cdr3_fasta(path::AbstractString)
     return cdr3s
 end
 
-# =============================================================================================== #
-# Writing
-# =============================================================================================== #
+#################
+### CDR3 and Scoring
+#################
 
-function make_trace(an_)
-
-    um = 1000000
-
-    Dict(
-        "name" => "Naive",
-        "type" => "histogram",
-        "histnorm" => "probability",
-        "x" => lastindex(an_) <= um ? an_ : rand(an_, um),
-    )
-
-end
-
-function writ(ht, st, a1_, a2_)
-
-    Nucleus.Plotly.writ(
-        ht,
-        (make_trace(a1_), make_trace(a2_)),
-        Dict(
-            "yaxis" => Dict("title" => Dict("text" => "Probability")),
-            "xaxis" => Dict("title" => Dict("text" => st)),
-        ),
-    )
-
-end
-
-# =============================================================================================== #
-# MISC
-# =============================================================================================== #
-
-function make_dictionary(an_)
-
-    Dict(an_[nd] => nd for nd in eachindex(an_))
-
-end
-
-# =============================================================================================== #
-# CDR3
-# =============================================================================================== #
+using ProgressMeter
 
 function make_hamming_distance(s1, s2)
 
@@ -213,6 +174,15 @@ const blosum62 = Dict{Tuple{Char,Char},Int}(
     ('P', 'V') => -2, ('S', 'S') => 4, ('S', 'T') => 1, ('S', 'W') => -3, ('S', 'Y') => -2, ('S', 'V') => -2, ('T', 'T') => 5, ('T', 'W') => -2, ('T', 'Y') => -2, ('T', 'V') => 0, ('W', 'W') => 11, ('W', 'Y') => 2, ('W', 'V') => -3, ('Y', 'Y') => 7, ('Y', 'V') => -1, ('V', 'V') => 4
 )
 
+function make_symmetric!(d::Dict{Tuple{Char,Char},Int})
+    for ((a, b), score) in collect(d)
+        d[(b, a)] = score
+    end
+    return d
+end
+
+const blosum62_sym = make_symmetric!(blosum62)
+
 function make_blosum_score(s1, s2)
 
     @assert length(s1) == length(s2)
@@ -236,10 +206,9 @@ function make_blosum_score(s1, s2)
     a1 = s1[nd]
     a2 = s2[nd]
 
-    return get(blosum62, (a1, a2), get(blosum62, (a2, a1), -Inf))
+    return get(blosum62_sym, (a1, a2), -Inf)
 
 end
-
 
 function make_distance(st_, ids)
 
@@ -275,10 +244,9 @@ function make_distance(st_, ids)
     return in__, po_
 end
 
-
-# =============================================================================================== #
-# Motif
-# =============================================================================================== #
+#################
+### Motifs
+#################
 
 # count whether motif is present at least once per cdr3 for all cdr3s
 
@@ -382,18 +350,7 @@ function get_motifs(st_::AbstractVector{<:AbstractString}, min::Int, max::Int, d
 
 end
 
-using Statistics
-using HypothesisTests
-
-function find_significant_motifs(
-    motifs, cdrs1, cdrs2;
-    pvalue_cutoff::Float64=0.01,
-    min_fold=(1000.0, 100.0, 10.0),
-    fold_lengths=(2, 3, 4),
-    min_count::Int=3,
-    use_fold_cutoff::Bool=true,
-    pseudocount::Float64=0.01,
-)
+function find_significant_motifs(motifs, cdrs1, cdrs2; pvalue_cutoff::Float64=0.01, min_fold=(1000.0, 100.0, 10.0), fold_lengths=(2, 3, 4), min_count::Int=3, use_fold_cutoff::Bool=true, pseudocount::Float64=0.01,)
 
     motifs_list = collect(keys(motifs))
     L = length(motifs_list)
@@ -446,7 +403,7 @@ function find_significant_motifs(
 
     significant = Dict{String,Float64}()
 
-    for j in 1:L
+    @showprogress desc = "Finding significant motifs..." for j in 1:L
         m = motifs_list[j]
 
         a = 0
@@ -488,157 +445,102 @@ end
 # takes list of cdrs and checks for a motif, making pairs
 
 function make_motif_pairs(st_::AbstractVector{<:AbstractString}, motif::AbstractString)
-    u1 = lastindex(st_)
-    u2 = div(u1 * (u1 - 1), 2)
 
-    in__ = Vector{Tuple{Int,Int}}(undef, u2)
-    po_ = Vector{Int}(undef, u2)
+    booler = occursin('.', motif) ? Regex(motif) : nothing
 
-    i1 = 0
+    hits = Dict{Int,Int}()
 
-    booler = nothing
+    for i in eachindex(st_)
+        s = st_[i]
+        core = lastindex(s) < 7 ? "" : s[4:(end-3)]
+        isempty(core) && continue
 
-    if occursin('.', motif)
-        booler = Regex(motif)
+        nd = booler === nothing ? findfirst(motif, core) : findfirst(booler, core)
+        nd === nothing && continue
+
+        hits[i] = first(nd)
     end
 
-    for i2 in 1:u1, i3 in (i2+1):u1
+    hit_indices = collect(keys(hits))
+    n = length(hit_indices)
 
-        s1, s2 = st_[i2], st_[i3]
-        core1 = lastindex(s1) < 7 ? "" : s1[4:(end-3)]
-        core2 = lastindex(s2) < 7 ? "" : s2[4:(end-3)]
+    in__ = Tuple{Int,Int}[]
+    po_ = Int[]
 
-        has1 = false
-        has2 = false
+    for a in 1:n, b in (a+1):n
+        i2 = hit_indices[a]
+        i3 = hit_indices[b]
 
-        if booler === nothing
-            has1 = occursin(motif, core1)
-            has2 = occursin(motif, core2)
-        else
-            has1 = occursin(booler, core1)
-            has2 = occursin(booler, core2)
+        if abs(hits[i2] - hits[i3]) <= 3
+            push!(in__, (i2, i3))
+            push!(po_, 1)
         end
-
-        if has1 && has2
-
-            nd1 = nothing
-            nd2 = nothing
-
-            if booler === nothing
-                nd1 = findfirst(motif, core1)
-                nd2 = findfirst(motif, core2)
-            else
-                nd1 = findfirst(booler, core1)
-                nd2 = findfirst(booler, core2)
-            end
-
-            a1 = first(nd1)
-            b1 = first(nd2)
-
-            if abs(a1 - b1) ≤ 3
-                i1 += 1
-                in__[i1] = (i2, i3)
-                po_[i1] = 1
-            end
-
-        end
-
     end
-
-    resize!(in__, i1)
-    resize!(po_, i1)
 
     return in__, po_
 end
 
-# =============================================================================================== #
-# Graphing
-# =============================================================================================== #
+#################
+### Making Edges
+#################
 
 function make_vertices!(g, cdrs)
     isblank(x) = x === nothing || x === missing || x in ("None", "none", "NA", "na", "Na", " ", "  ", "")
 
     for row in 1:nrow(cdrs)
-
         label = String(cdrs.cdr3[row])
 
-        add_vertex!(g, label, Dict(:index => row)) # add vertex
+        add_vertex!(g, label, Dict(:index => row))
 
-        # check for vgenes, etc. and store if they exist
-        if !isblank(cdrs.vgene[row])
-            g[label][:vgene] = cdrs.vgene[row]
-        end
+        g[label][:cdr3_length] = cdrs.cdr3_length[row]
+        g[label][:duplicate_count] = cdrs.duplicate_count[row]
 
-        try
-            if !isblank(cdrs.jgene[row])
-                g[label][:jgene] = cdrs.jgene[row]
+        if "vgenes" in names(cdrs) && cdrs.vgenes[row] !== missing && cdrs.vgenes[row] !== nothing
+            v = cdrs.vgenes[row]
+            if !(v isa AbstractVector && isempty(v))
+                g[label][:vgene] = v
             end
-        catch
         end
 
-        try
-            if !isblank(cdrs.dgene[row])
-                g[label][:dgene] = cdrs.dgene[row]
+        if "jgenes" in names(cdrs) && cdrs.jgenes[row] !== missing && cdrs.jgenes[row] !== nothing
+            v = cdrs.jgenes[row]
+            if !(v isa AbstractVector && isempty(v))
+                g[label][:jgene] = v
             end
-        catch
         end
 
-        if !isblank(cdrs.donor[row])
-            g[label][:donor] = cdrs.donor[row]
+        if "dgenes" in names(cdrs) && cdrs.dgenes[row] !== missing && cdrs.dgenes[row] !== nothing
+            v = cdrs.dgenes[row]
+            if !(v isa AbstractVector && isempty(v))
+                g[label][:dgene] = v
+            end
+        end
+
+        if "barcodes" in names(cdrs) && cdrs.barcodes[row] !== missing && cdrs.barcodes[row] !== nothing
+            v = cdrs.barcodes[row]
+            if !(v isa AbstractVector && isempty(v))
+                g[label][:barcodes] = v
+            end
+        end
+
+        if "samples" in names(cdrs) && cdrs.samples[row] !== missing && cdrs.samples[row] !== nothing
+            v = cdrs.samples[row]
+            if !(v isa AbstractVector && isempty(v))
+                g[label][:samples] = v
+            end
+        end
+
+        if "clones" in names(cdrs) && cdrs.clones[row] !== missing && cdrs.clones[row] !== nothing
+            g[label][:clones] = cdrs.clones[row]
+        end
+
+        if "tcr_ids" in names(cdrs) && cdrs.clones[row] !== missing && cdrs.clones[row] !== nothing
+            g[label][:tcr_ids] = cdrs.clones[row]
         end
 
     end
 
-    return g # return graph
-
-end
-
-function make_vertices_indexed!(g, cdrs)
-    isblank(x) = x === nothing || x === missing || x in ("None", "none", "NA", "na", "Na", " ", "  ", "")
-
-    if :row_index ∉ names(cdrs) # make sure rows are indexed
-        cdrs.row_index = collect(1:nrow(cdrs))
-    end
-
-    for row in 1:nrow(cdrs)
-
-        label = Int(cdrs.row_index[row])
-        cdr3_aa = String(cdrs.cdr3[row])
-
-        if !has_vertex(g, label)
-            add_vertex!(g, label, Dict(:cdr3 => cdr3_aa))
-        end
-
-        # check for vgenes, etc. and store if they exist
-        if !isblank(cdrs.vgene[row])
-            g[label][:vgene] = cdrs.vgene[row]
-        end
-
-        try
-            if !isblank(cdrs.jgene[row])
-                g[label][:jgene] = cdrs.jgene[row]
-            end
-        catch
-        end
-
-        try
-            if !isblank(cdrs.dgene[row])
-                g[label][:dgene] = cdrs.dgene[row]
-            end
-        catch
-        end
-
-        try
-            if !isblank(cdrs.donor[row])
-                g[label][:donor] = cdrs.donor[row]
-            end
-        catch
-        end
-
-    end
-
-    return g # return graph
-
+    return g
 end
 
 # make a global edge w/ annotation of hamming disrance
@@ -655,109 +557,168 @@ function add_local_edge!(g, u, v, motif::String, pval)
 end
 
 # initialises the graph and makes edges
-#
-# ADD blosum scoring cutoff
-#
 function make_edges(cdrs, motifs, isglobal, islocal)
 
-    cdrs.cdr3 = String.(cdrs.cdr3) # ensure is string
+    cdrs.cdr3 = String.(cdrs.cdr3)
+
+    cdrs[!, :row_index] = 1:nrow(cdrs)
 
     g = MetaGraph(
         Graph();
-        label_type=Int,
+        label_type=String,
         vertex_data_type=Dict{Symbol,Any},
         edge_data_type=Dict{Symbol,Any},
     )
 
-    g = make_vertices_indexed!(g, cdrs)
+    g = make_vertices!(g, cdrs)
 
     if isglobal == true
 
         pairs, dists = make_distance(cdrs.cdr3, cdrs.row_index)
 
-        @showprogress desc = "Making edges..." for (index, (u, v)) in enumerate(pairs)
+        @showprogress desc = "Making global edges..." for (index, (u, v)) in enumerate(pairs)
 
             d = dists[index]
 
-            # check distance and calculate blosum score if needed
-            if d == 1
+            s1 = cdrs.cdr3[u]
+            s2 = cdrs.cdr3[v]
 
+            if d == 1
                 s1 = cdrs.cdr3[u]
                 s2 = cdrs.cdr3[v]
-
+                length(s1) == length(s2) || continue
                 make_blosum_score(s1, s2) >= 0 || continue
-
             else
                 d <= 1 || continue
             end
 
-            # add edge
-            if haskey(g, u, v)
-                g[u, v][:distance] = d
+            if haskey(g, s1, s2)
+                g[s1, s2][:distance] = d
             else
-                add_global_edge!(g, u, v, d)
+                add_global_edge!(g, s1, s2, d)
             end
 
         end
     end
 
-
     if islocal == true
 
-        @showprogress desc = "Making edges..." for (motif, pval) in motifs
+        @showprogress desc = "Making local edges..." for (motif, pval) in motifs
 
-            pairs, _ = make_motif_pairs(cdrs.cdr3, motif, cdrs.row_index)
+            pairs, _ = make_motif_pairs(cdrs.cdr3, motif)
 
             for (u, v) in pairs
 
-                if haskey(g, u, v)
+                s1 = cdrs.cdr3[u]
+                s2 = cdrs.cdr3[v]
 
-                    if !haskey(g[u, v], :motifs)
-                        g[u, v][:motifs] = String[]
-
+                if haskey(g, s1, s2)
+                    if !haskey(g[s1, s2], :motifs)
+                        g[s1, s2][:motifs] = String[]
                     end
-
-                    if !haskey(g[u, v], :motif_pvals)
-                        g[u, v][:motif_pvals] = Float64[]
+                    if !haskey(g[s1, s2], :motif_pvals)
+                        g[s1, s2][:motif_pvals] = Float64[]
                     end
-
-                    push!(g[u, v][:motifs], motif)
-                    push!(g[u, v][:motif_pvals], pval)
-
+                    push!(g[s1, s2][:motifs], motif)
+                    push!(g[s1, s2][:motif_pvals], pval)
                 else
-                    add_local_edge!(g, u, v, motif, pval)
+                    add_local_edge!(g, s1, s2, motif, pval)
                 end
-
 
             end
         end
-    end # end of local edges
+    end
 
     return g
 
 end
 
+function get_clusters_and_sizes(g)
+    clusters = connected_components(g)
+    sizes = [length(c) for c in clusters]
+    return clusters, sizes
+end
 
-# =============================================================================================== #
-# Clusters / Significance
-#
-# TO DO: multiple comparisons correction?
-# =============================================================================================== #
+function remove_small_clusters(g, min_size::Int)
+
+    clusters = connected_components(g)
+    keep_labels = Set{String}()
+
+    for cluster in clusters
+        if length(cluster) >= min_size
+            for v in cluster
+                push!(keep_labels, label_for(g, v))
+            end
+        end
+    end
+
+    g_new = MetaGraph(
+        Graph();
+        label_type=String,
+        vertex_data_type=Dict{Symbol,Any},
+        edge_data_type=Dict{Symbol,Any},
+    )
+
+    for lbl in keep_labels
+        add_vertex!(g_new, lbl, deepcopy(g[lbl]))
+    end
+
+    for lbl in keep_labels
+        v = code_for(g, lbl)
+        for u in neighbors(g, v)
+            lu = label_for(g, u)
+            if lu in keep_labels && lbl < lu
+                add_edge!(g_new, lbl, lu, deepcopy(g[lbl, lu]))
+            end
+        end
+    end
+
+    n_removed = nv(g) - nv(g_new)
+    println("Removed $n_removed vertices across $(length(clusters) - count(c -> length(c) >= min_size, clusters)) clusters.")
+
+    return g_new
+end
+
+#################
+### Scoring / P-Vals
+#################
 
 # length score
 # for each group, resample 1000 groups of group size n and measure cdr3 length distribution.
 
-using StatsBase: mode
+function load_cdr3len_freqs(path::AbstractString)
 
-using StatsBase, Statistics
+    freqs = Dict{Int,Float64}()
 
-function find_length_pvals(g, cdrs2, sim_depth)
+    open(path) do f
+
+        for line in eachline(f)
+            isempty(strip(line)) && continue
+            parts = split(strip(line), '\t')
+            length(parts) == 2 || continue
+            len = parse(Int, replace(String(parts[1]), "Len" => ""))
+            freq = parse(Float64, parts[2])
+            freqs[len] = freq
+        end
+
+    end
+
+    return freqs
+end
+
+function find_length_pvals(g, sim_depth)
+
+    len_freq_path = joinpath(IN, "tcrb-human.cdr3len-freq.txt")
+    ref_freqs = load_cdr3len_freqs(len_freq_path)
+
+    len_keys = collect(keys(ref_freqs))
+    len_probs = Weights([ref_freqs[l] for l in len_keys])
+
     clusters = connected_components(g)
 
-    modes = Vector{Int}()
-    props = Vector{Float64}()
+    sample_scores = Float64[]
+    ns = Int[]
 
-    # get most common length for each cluster
     for cluster in clusters
 
         labels = label_for.(Ref(g), cluster)
@@ -765,34 +726,102 @@ function find_length_pvals(g, cdrs2, sim_depth)
         cluster_lengths = Int[]
 
         for lbl in labels
-
-            haskey(g[lbl], :cdr3) || continue
-            push!(cluster_lengths, length(String(g[lbl][:cdr3])))
-
+            push!(cluster_lengths, g[lbl][:cdr3_length])
         end
 
-        m = mode(cluster_lengths)
-        push!(modes, m)
-        push!(props, count(==(m), cluster_lengths) / length(cluster_lengths))
+        n = length(cluster_lengths)
+
+        if n == 0
+            push!(sample_scores, 1.0)
+            push!(ns, 0)
+            continue
+        end
+
+        cl_tab = countmap(cluster_lengths)
+        p_len = [cnt / n for cnt in values(cl_tab)]
+        sample_score = prod(p_len)
+
+        push!(sample_scores, sample_score)
+        push!(ns, n)
 
     end
 
-    # randomly pick n sequences from the null distribution and compare to
-    cluster_sizes = [length(cluster) for cluster in clusters]
     p_vals = Float64[]
 
-    for (index, size) in enumerate(cluster_sizes)
+    for (index, n) in enumerate(ns)
 
-        sim_props = Float64[]
-
-        for i in 1:sim_depth
-            random_cdrs = sample(cdrs2, size; replace=true, ordered=false)
-            cluster_lengths = [length(s) for s in random_cdrs]
-            push!(sim_props, (count(==(modes[index]), cluster_lengths)) / size)
+        if n == 0
+            push!(p_vals, 1.0)
+            continue
         end
 
-        # count number of times sim beats data?
-        p_val = ((count(>=(props[index]), sim_props)) + 1) / (sim_depth + 1)
+        sim_scores = Float64[]
+
+        for i in 1:sim_depth
+            sim_lengths = sample(len_keys, len_probs, n; replace=true)
+            sim_tab = countmap(sim_lengths)
+            p_len = [cnt / n for cnt in values(sim_tab)]
+            push!(sim_scores, prod(p_len))
+        end
+
+        p_val = (count(>=(sample_scores[index]), sim_scores) + 1) / (sim_depth + 1)
+        push!(p_vals, p_val)
+
+    end
+
+    return p_vals
+end
+
+function find_length_pvals_sampling(g, cdrs2, sim_depth)
+
+    clusters = connected_components(g)
+
+    sample_scores = Float64[]
+    ns = Int[]
+
+    # get product-of-frequencies score for each cluster
+    for cluster in clusters
+        labels = label_for.(Ref(g), cluster)
+
+        cluster_lengths = Int[]
+        for lbl in labels
+            push!(cluster_lengths, g[lbl][:cdr3_length])
+        end
+
+        n = length(cluster_lengths)
+        if n == 0 # skip if empty
+            push!(sample_scores, 1.0)
+            push!(ns, 0)
+            continue
+        end
+
+        cl_tab = countmap(cluster_lengths)
+        p_len = [cnt / n for cnt in values(cl_tab)]
+
+        sample_score = prod(p_len)
+
+        push!(sample_scores, sample_score)
+        push!(ns, n)
+    end
+
+    p_vals = Float64[]
+    for (index, n) in enumerate(ns)
+        if n == 0
+            push!(p_vals, 1.0)
+            continue
+        end
+
+        sim_scores = Float64[]
+        for i in 1:sim_depth
+            random_cdrs = sample(cdrs2, n; replace=true, ordered=false)
+            sim_lengths = [length(s) for s in random_cdrs]
+
+            sim_tab = countmap(sim_lengths)
+            p_len = [cnt / n for cnt in values(sim_tab)]
+            push!(sim_scores, prod(p_len))
+        end
+
+        p_val = (count(>=(sample_scores[index]), sim_scores) + 1) / (sim_depth + 1)
         push!(p_vals, p_val)
 
     end
@@ -801,29 +830,45 @@ function find_length_pvals(g, cdrs2, sim_depth)
 
 end
 
+# network size pval
 
-function score_lengths(g, cdrs2) # adds length scores to the graph
+function find_size_pval(g, cdrs_ref::AbstractVector{<:AbstractString}, motifs; nsim::Int=1000, isglobal::Bool=true, islocal::Bool=true, rng::AbstractRNG=Random.default_rng())
 
-    clusters = connected_components(g)
-    p_vals = find_length_pvals(g, cdrs2)
+    n_sample = nv(g)
+    n_ref = length(cdrs_ref)
 
-    for (index, cluster) in enumerate(clusters)
+    clusters, sizes_obs = get_clusters_and_sizes(g)
 
-        for vertex in cluster
-            lbl = label_for(g, vertex)
-            g[lbl][:length_pval] = p_vals[index]
-        end
+    sim_all_sizes = Int[]
 
+    for x in 1:nsim
+        idx = sample(rng, 1:n_ref, n_sample; replace=true)
+        sub_cdr3s = cdrs_ref[idx]
+
+        sub = DataFrame(
+            cdr3=sub_cdr3s,
+            cdr3_length=length.(sub_cdr3s),
+            duplicate_count=ones(Int, length(sub_cdr3s)),
+            row_index=1:length(sub_cdr3s),
+        )
+
+        g_ref = make_edges(sub, motifs, isglobal, islocal)
+        _, sim_sizes = get_clusters_and_sizes(g_ref)
+
+        append!(sim_all_sizes, sim_sizes)
     end
 
-    return p_vals
+    pvals = Float64[]
+    for s_obs in sizes_obs
+        wins = count(x -> x >= s_obs, sim_all_sizes)
+        p = wins / length(sim_all_sizes)
+        push!(pvals, p == 0.0 ? 1.0 / nsim : p)
+    end
 
+    return pvals
 end
 
-
-#_______________#
-# v gene score
-# hyper geomtric or parameteric when over 200 sequences in one group
+# v gene and j gene enrichment score
 
 using Distributions
 
@@ -831,41 +876,63 @@ using StatsBase, Statistics
 
 using StatsBase
 
-function score_vgene(g, sim_depth)
+function load_vgene_freqs(path::AbstractString)
+
+    freqs = Dict{String,Float64}()
+    open(path) do f
+
+        for line in eachline(f)
+            isempty(strip(line)) && continue
+            parts = split(strip(line), '\t')
+            length(parts) == 2 || continue
+            gene = String(parts[1])
+            freq = parse(Float64, parts[2])
+            freqs[gene] = freq
+        end
+
+    end
+
+    return freqs
+end
+
+function find_vgene_pval(g, sim_depth)
+
+    vgene_freq_path = joinpath(IN, "tcrb-human.v-freq.txt")
+    ref_freqs = load_vgene_freqs(vgene_freq_path)
+
+    v_keys = collect(keys(ref_freqs))
+    v_probs = Weights([ref_freqs[v] for v in v_keys])
+
     clusters = connected_components(g)
 
     counts = Vector{Dict{String,Int}}(undef, length(clusters))
-    totals = Dict{String,Int}()
-
-    # number of vgene entries per cluster (not vertices)
     entry_sizes = Vector{Int}(undef, length(clusters))
 
     for (index, cluster) in enumerate(clusters)
+
         di = Dict{String,Int}()
         entry_count = 0
 
         for vertex in cluster
+
             lbl = label_for(g, vertex)
             haskey(g[lbl], :vgene) || continue
 
-            vgenes = g[lbl][:vgene]  # now a vector
+            vgenes = g[lbl][:vgene]
+            vgenes = vgenes isa AbstractVector ? vgenes : [vgenes]
 
             for vg in vgenes
-                v = String(vg)
-                di[v] = get!(di, v, 0) + 1
-                totals[v] = get!(totals, v, 0) + 1
+                s = String(vg)
+                di[s] = get!(di, s, 0) + 1
                 entry_count += 1
             end
+
         end
 
         counts[index] = di
         entry_sizes[index] = entry_count
-    end
 
-    # global reference distribution from dataset
-    v_keys = collect(keys(totals))
-    v_probs = [totals[v] for v in v_keys]
-    v_probs = v_probs ./ sum(v_probs)
+    end
 
     cluster_pvals = Vector{Dict{String,Float64}}(undef, length(clusters))
 
@@ -878,16 +945,96 @@ function score_vgene(g, sim_depth)
             continue
         end
 
-        # normalize by total vgene entries
-        p_v = [cnt / n for cnt in values(di)]
-        sample_score = prod(p_v)
+        sample_score = sum(log(cnt / n) for cnt in values(di))
 
         wins = 0
         for i in 1:sim_depth
             random_vgenes = sample(v_keys, Weights(v_probs), n; replace=true)
             sim_tab = countmap(random_vgenes)
-            p_sim = [cnt / n for cnt in values(sim_tab)]
-            sim_score = prod(p_sim)
+            sim_score = sum(log(cnt / n) for cnt in values(sim_tab))
+
+            if sim_score >= sample_score
+                wins += 1
+            end
+        end
+
+        p = wins / sim_depth
+        p = (p == 0.0) ? (1.0 / sim_depth) : p
+
+        cluster_pvals[index] = Dict("vgene_spectratype_p" => p)
+
+    end
+
+    return cluster_pvals
+end
+
+function find_vgene_pval_sampling(g, sim_depth)
+
+    clusters = connected_components(g)
+
+    # collect all vgenes from the graph for resampling
+    totals = Dict{String,Int}()
+
+    for v in vertices(g)
+        lbl = label_for(g, v)
+        haskey(g[lbl], :vgene) || continue
+
+        vgenes = g[lbl][:vgene]
+        vgenes = vgenes isa AbstractVector ? vgenes : [vgenes]
+
+        for vg in vgenes
+            s = String(vg)
+            totals[s] = get!(totals, s, 0) + 1
+        end
+    end
+
+    v_keys = collect(keys(totals))
+    v_probs = Weights([totals[v] for v in v_keys])
+    v_probs = v_probs ./ sum(v_probs)
+
+    # collect per cluster vgene counts
+    counts = Vector{Dict{String,Int}}(undef, length(clusters))
+    entry_sizes = Vector{Int}(undef, length(clusters))
+
+    for (index, cluster) in enumerate(clusters)
+        di = Dict{String,Int}()
+        entry_count = 0
+
+        for vertex in cluster
+            lbl = label_for(g, vertex)
+            haskey(g[lbl], :vgene) || continue
+
+            vgenes = g[lbl][:vgene]
+            vgenes = vgenes isa AbstractVector ? vgenes : [vgenes]
+
+            for vg in vgenes
+                s = String(vg)
+                di[s] = get!(di, s, 0) + 1
+                entry_count += 1
+            end
+        end
+
+        counts[index] = di
+        entry_sizes[index] = entry_count
+    end
+
+    cluster_pvals = Vector{Dict{String,Float64}}(undef, length(clusters))
+
+    for (index, di) in enumerate(counts)
+        n = entry_sizes[index]
+
+        if isempty(di) || n == 0
+            cluster_pvals[index] = Dict("NA" => 1.0)
+            continue
+        end
+
+        sample_score = sum(log(cnt / n) for cnt in values(di))
+
+        wins = 0
+        for i in 1:sim_depth
+            random_vgenes = sample(v_keys, Weights(v_probs), n; replace=true)
+            sim_tab = countmap(random_vgenes)
+            sim_score = sum(log(cnt / n) for cnt in values(sim_tab))
 
             if sim_score >= sample_score
                 wins += 1
@@ -900,24 +1047,15 @@ function score_vgene(g, sim_depth)
         cluster_pvals[index] = Dict("vgene_spectratype_p" => p)
     end
 
-    # write pval back to vertices
-    #for (index, cluster) in enumerate(clusters)
-    #for vertex in cluster
-    #lbl = label_for(g, vertex)
-    #g[lbl][:vgene_pval] = cluster_pvals[index]
-    #end
-    #end
-
     return cluster_pvals
 end
 
-function score_jgene(g, sim_depth)
+function find_jgene_pval_sampling(g, sim_depth)
     clusters = connected_components(g)
 
     counts = Vector{Dict{String,Int}}(undef, length(clusters))
     totals = Dict{String,Int}()
 
-    # number of jgene entries per cluster (not vertices)
     entry_sizes = Vector{Int}(undef, length(clusters))
 
     for (index, cluster) in enumerate(clusters)
@@ -928,7 +1066,7 @@ function score_jgene(g, sim_depth)
             lbl = label_for(g, vertex)
             haskey(g[lbl], :jgene) || continue
 
-            jgenes = g[lbl][:jgene]  # now a vector
+            jgenes = g[lbl][:jgene]
 
             for jg in jgenes
                 j = String(jg)
@@ -942,7 +1080,6 @@ function score_jgene(g, sim_depth)
         entry_sizes[index] = entry_count
     end
 
-    # global reference distribution from dataset
     j_keys = collect(keys(totals))
     j_probs = [totals[j] for j in j_keys]
     j_probs = j_probs ./ sum(j_probs)
@@ -958,8 +1095,7 @@ function score_jgene(g, sim_depth)
             continue
         end
 
-        # normalize by total jgene entries
-        p_v = [cnt / n for cnt in values(di)]
+        p_j = [cnt / n for cnt in values(di)]
         sample_score = prod(p_j)
 
         wins = 0
@@ -991,109 +1127,124 @@ function score_jgene(g, sim_depth)
     return cluster_pvals
 end
 
-#_______________#
+##################### motif scoring
+#
+function motif_hits_by_cdr3(cdr3s::AbstractVector{<:AbstractString}, motifs::AbstractVector{<:AbstractString})
 
-# hla score
+    hits = Dict{String,Dict{Int,Vector{Int}}}()
 
-# for each CDR, get donor
-# check hla file for shared hlas
-# do enrichment exactly as done for v-genes
 
-function allele_group(allele::String)
-    m = match(r"^(HLA-)?([A-Z]{1,4}\d?)", allele)
-    return m === nothing ? allele : m.captures[end]
-end
+    matchers = Dict{String,Union{Nothing,Regex}}()
 
-function score_hla(g)
-    clusters = connected_components(g, hla_df)
+    for m in motifs
 
-    # make dictionaries and vectors to store stuff in ✅
-    counts = Vector{Dict{String,Int}}(undef, length(clusters))
+        hits[m] = Dict{Int,Vector{Int}}()
+        matchers[m] = occursin('.', m) ? Regex(m) : nothing
 
-    totals = Dict{String,Int}()
-    sizes = Vector{Int}(undef, length(clusters))
+    end
 
-    for (index, cluster) in enumerate(clusters) # count things ✅
+    for (i, s_) in pairs(cdr3s)
+        s = uppercase(replace(String(s_), r"\s+" => ""))
+        core = (lastindex(s) < 7) ? "" : s[4:(end-3)]
+        isempty(core) && continue
 
-        di = Dict{String,Int}()
-        sizes[index] = length(cluster)
 
-        for vertex in cluster
+        for motif in motifs
 
-            donor = g[label_for(g, vertex)][:donor]
+            rx = matchers[motif]
+            start = firstindex(core)
+            pos = Int[]
 
-            row_index = findfirst(==(donor), hla_df.donor)
-            row_index === nothing && continue # skip typing for donors without HLA type
-            row = hla_df[row_index, 2:end]
+            searcher = rx === nothing ? motif : rx
+            start = firstindex(core)
 
-            for allele in row
+            while start <= lastindex(core)
 
-                if ismissing(allele)
+                match = findnext(searcher, core, start)
+                match === nothing && break
 
-                    continue
+                pos_start = first(match)
+                push!(pos, pos_start)
 
-                end
-
-                a = String(allele) # needs to be string
-
-                totals[allele] = get(totals, allele, 0) + 1 # store total counts for distribution to compare cluster to
-                di[allele] = get!(di, allele, 0) + 1
-
+                start = pos_start + 1
             end
 
+            if !isempty(pos)
+                hits[motif][i] = pos
+            end
 
-        end
-
-        counts[index] = di # store individual counts for each cluster
-
-    end
-
-    cluster_pvals = Vector{Dict{String,Float64}}(undef, length(clusters))
-
-    for (index, di) in enumerate(counts)
-
-        counts[index]
-        p_vals = Dict{String,Float64}()
-
-        for (hla_, count_) in di
-
-            distribution = Hypergeometric(totals[index][hla_], sum(sizes) - totals[index][hla_], sizes[index])
-            p = ccdf(distribution, count_ - 1)
-            p_vals[hla_] = p
-
-        end
-
-        cluster_pvals[index] = p_vals
-
-    end
-
-    # generate table
-
-    pval_df = DataFrame(cluster=Int[], allele=String[], allele_group=String[], pval=Float64[])
-
-    for (cluster, d) in pairs(cluster_pvals)
-        for (allele, p) in d
-            group = allele_group(allele)
-            push!(pval_df, (
-                cluster=cluster,
-                allele=allele,
-                group=group,
-                pval=p
-            ))
         end
     end
 
-    return pval_df
-    # heatmap_df = unstack(df, :cluster, :allele, :pval)
+    return hits
 
 end
 
+function find_cluster_motif_pval(g; ref_hits::Dict{String,<:Any}, N_ref::Int, tail::Symbol=:right)
 
-# motif scoring
+    clusters = connected_components(g)
+    N_sample = nv(g)
 
-using Graphs
+    cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
 
-function motif_scoring(g)
+    for (index, cluster) in enumerate(clusters)
+
+        in_cluster = falses(N_sample)
+        in_cluster[cluster] .= true
+
+        motif_vertices = Dict{String,Set{Int}}()
+
+        for u in cluster
+            for v in neighbors(g, u)
+
+                if in_cluster[v] && u < v
+
+                    lu = label_for(g, u)
+                    lv = label_for(g, v)
+
+                    if haskey(g, lu, lv) && haskey(g[lu, lv], :motifs)
+
+                        motifs = g[lu, lv][:motifs]::Vector{String}
+
+                        for motif in motifs
+                            s = get!(motif_vertices, motif, Set{Int}())
+                            push!(s, u)
+                            push!(s, v)
+                        end
+
+                    end
+                end
+            end
+        end
+
+        pairs = Tuple{String,Float64}[]
+
+        for (motif, vertex_set) in motif_vertices
+
+            k_obs = length(vertex_set)
+            k_ref = haskey(ref_hits, motif) ? length(ref_hits[motif]) : 0
+
+            if N_ref <= 0 || k_ref <= 0
+                push!(pairs, (motif, 1.0))
+                continue
+            end
+
+            t = FisherExactTest(k_obs, N_sample - k_obs, k_ref, N_ref - k_ref)
+
+            p = pvalue(t, tail=tail)
+
+            push!(pairs, (motif, p))
+
+        end
+
+        cluster_motifs[index] = pairs
+    end
+
+    return cluster_motifs
+end
+
+
+function find_global_motif_pval(g)
 
     clusters = connected_components(g)
     cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
@@ -1134,223 +1285,475 @@ function motif_scoring(g)
     end
 
     return cluster_motifs
+end
+
+
+##############################
+
+# clonal enrichment pval
+function find_clone_pval(g, sim_depth)
+    clusters = connected_components(g)
+
+    all_clones = Float64[]
+
+    for v in vertices(g)
+
+        lbl = label_for(g, v)
+        haskey(g[lbl], :clones) || continue
+        append!(all_clones, Float64.(g[lbl][:clones]))
+
+    end
+
+    sample_scores = Float64[]
+    cluster_sizes = Int[]
+
+    for cluster in clusters
+
+        labels = label_for.(Ref(g), cluster)
+        clones = Float64[]
+
+        for lbl in labels
+            haskey(g[lbl], :clones) || continue
+            append!(clones, Float64.(g[lbl][:clones]))
+        end
+
+        n = length(clones)
+        push!(cluster_sizes, n)
+        push!(sample_scores, n == 0 ? 0.0 : sum(clones) / n)
+
+    end
+
+    p_vals = Float64[]
+
+    for (index, n) in enumerate(cluster_sizes)
+
+        if n == 0
+            push!(p_vals, 1.0)
+            continue
+        end
+
+        sample_score = sample_scores[index]
+        counter = 0
+
+        for i in 1:sim_depth
+            sim_clones = sample(all_clones, n; replace=true)
+            test_score = sum(sim_clones) / n
+            counter += test_score >= sample_score ? 1 : 0
+        end
+
+        push!(p_vals, counter == 0 ? 1.0 / sim_depth : counter / sim_depth)
+
+    end
+
+    return p_vals
 
 end
 
-using HypothesisTests
-
-function motif_scoring_new(g; ref_hits::Dict{String,<:Any}, N_ref::Int, tail::Symbol=:right)
-
+function find_cluster_type(g)
     clusters = connected_components(g)
-    N_sample = nv(g)
+    types = Vector{Symbol}(undef, length(clusters))
 
-    cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
+    for (i, cluster) in enumerate(clusters)
+        has_distance = false
+        has_motifs = false
+        saw_edge = false
 
-    for (index, cluster) in enumerate(clusters)
+        # iterate edges induced by the cluster
+        for a in 1:length(cluster)-1
+            u = cluster[a]
+            for b in a+1:length(cluster)
+                v = cluster[b]
 
-        in_cluster = falses(N_sample)
-        in_cluster[cluster] .= true
+                has_edge(g, u, v) || continue
+                saw_edge = true
 
-        # motif => Set of vertices in this cluster that are incident to an edge carrying that motif
-        motif_vertices = Dict{String,Set{Int}}()
+                lu = label_for(g, u)
+                lv = label_for(g, v)
 
-        for u in cluster
-            for v in neighbors(g, u)
-
-                if in_cluster[v] && u < v
-
-                    lu = label_for(g, u)
-                    lv = label_for(g, v)
-
-                    if haskey(g, lu, lv) && haskey(g[lu, lv], :motifs)
-
-                        motifs = g[lu, lv][:motifs]::Vector{String}
-
-                        for motif in motifs
-                            s = get!(motif_vertices, motif, Set{Int}())
-                            push!(s, u)
-                            push!(s, v)
-                        end
-
-                    end
+                if haskey(g[lu, lv], :distance)
+                    has_distance = true
                 end
+
+                if haskey(g[lu, lv], :motifs)
+                    has_motifs = true
+                end
+
+                if has_distance && has_motifs
+                    types[i] = :mixed
+                    @goto done_cluster
+                end
+
             end
         end
 
-        pairs = Tuple{String,Float64}[]
-
-        for (motif, vertex_set) in motif_vertices
-
-            k_obs = length(vertex_set)
-            k_ref = haskey(ref_hits, motif) ? length(ref_hits[motif]) : 0
-
-            if N_ref <= 0 || k_ref <= 0
-                push!(pairs, (motif, 1.0))
-                continue
-            end
-
-            t = FisherExactTest(k_obs,
-                N_sample - k_obs,
-                k_ref,
-                N_ref - k_ref)
-
-            p = pvalue(t, tail=tail)
-
-            push!(pairs, (motif, p))
-        end
-
-        cluster_motifs[index] = pairs
-    end
-
-    return cluster_motifs
-end
-
-
-# =============================================================================================== #
-# Summarising
-# =============================================================================================== #
-#
-
-# create function to report for each cluster:
-# -> number of members
-# -> number of unique donors and unique clones (unique alpha and beta?) - less of a priority
-# -> length of cdr3 p-val
-# -> motif p-val
-# -> v-gene pval
-# -> hla p-vals
-# -> list of probable hla types
-
-# length -> vector of p-vals
-# indexed dictionary with correct p-val of most significant v-gene
-
-function summarize_data(g, vgene_pvals, length_pvals, cluster_motifs)
-
-    # get cluster sizes
-
-    clusters = connected_components(g)
-
-    # things to count:
-    # unique members, unique cdr3s, (later - unique clones)
-    # find most significant motif p-val
-
-    # make vector w/ dictionary of vgenes
-    cluster_sizes = Vector{Dict{String,Int}}(undef, length(clusters))
-    totals = Dict{String,Int}()
-    cluster_sizes = Vector{Int}(undef, length(clusters))
-    donor_sizes = Vector{Int}(undef, length(clusters))
-    cdr_sizes = Vector{Int}(undef, length(clusters))
-    length_pval = Vector{Float64}(undef, length(clusters))
-
-    # get cluster sizes and no. donors
-    for (index, cluster) in enumerate(clusters)
-
-        cluster_sizes[index] = length(cluster)
-
-        donors = String[]
-        cdrs = String[]
-
-        for vertex in cluster
-
-            lbl = label_for(g, vertex)
-
-            cdr3 = g[lbl][:cdr3]
-            push!(cdrs, String(cdr3))
-
-            if haskey(g[lbl], :donor)
-
-                d = g[lbl][:donor]
-                d === missing && continue
-                push!(donors, String(d))
-
-            end
-
-        end
-
-        donor_sizes[index] = length(unique(donors))
-        cdr_sizes[index] = length(unique(cdrs))
-    end
-
-    # get v-genes
-    vgenes = [first(keys(i)) for i in vgene_pvals]
-    v_pvals = [first(values(i)) for i in vgene_pvals]
-
-    # get motifs
-    top_motifs = Tuple{String,Float64}[]
-
-    for pairs in cluster_motifs
-        if isempty(pairs)
-
-            push!(top_motifs, ("", NaN))
-
+        if !saw_edge
+            types[i] = :none
+        elseif has_distance && !has_motifs
+            types[i] = :global
+        elseif has_motifs && !has_distance
+            types[i] = :local
         else
-
-            pvals = last.(pairs)
-            ind = argmin(pvals)
-            push!(top_motifs, pairs[ind])
-
+            # edges exist but neither key found anywhere
+            types[i] = :none
         end
+
+        @label done_cluster
+    end
+
+    return types
+end
+
+function summarize_clusters(
+    g,
+    min_size::Int;
+    sim_depth::Int=1000,
+    cdrs_ref=nothing,
+    motifs=nothing,
+    isglobal::Bool=true,
+    islocal::Bool=true,
+    nsim::Int=1000,
+    rng::AbstractRNG=Random.default_rng(),
+    run_length::Bool=true,
+    run_vgene::Bool=true,
+    run_jgene::Bool=true,
+    run_clone::Bool=true,
+    run_size::Bool=true,
+)
+
+    g = remove_small_clusters(g, min_size) # just in case small ones snuck in
+    clusters, sizes = get_clusters_and_sizes(g)
+    n_clusters = length(clusters)
+    types = find_cluster_type(g)
+
+    length_pvals = run_length ? find_length_pvals(g, sim_depth) : fill(missing, n_clusters)
+    vgene_pvals = run_vgene ? find_vgene_pval(g, sim_depth) : fill(missing, n_clusters)
+    jgene_pvals = run_jgene ? find_jgene_pval(g, sim_depth) : fill(missing, n_clusters)
+    clone_pvals = run_clone ? find_clone_pval(g, sim_depth) : fill(missing, n_clusters)
+
+    size_pvals = if run_size && cdrs_ref !== nothing && motifs !== nothing
+        find_size_pval(g, cdrs_ref, motifs; nsim, isglobal, islocal, rng)
+    else
+        fill(missing, n_clusters)
+    end
+
+    motif_results = find_global_motif_pval(g) # get global motif scores
+
+    rows = []
+
+    for (i, cluster) in enumerate(clusters)
+
+        # deduplicate motifs!!! important
+        seen_motifs = Set{String}()
+        uniq_motif_strs = String[]
+        uniq_motif_pvals = Float64[]
+
+        for (m, p) in motif_results[i]
+            if m ∉ seen_motifs
+                push!(seen_motifs, m)
+                push!(uniq_motif_strs, m)
+                push!(uniq_motif_pvals, p)
+            end
+        end
+
+        lp = length_pvals[i]
+        sp = size_pvals[i]
+        cp = clone_pvals[i]
+
+        vp = vgene_pvals[i] isa Dict ? get(vgene_pvals[i], "vgene_spectratype_p", missing) : missing
+        jp = jgene_pvals[i] isa Dict ? get(jgene_pvals[i], "jgene_spectratype_p", missing) : missing
+
+        # combined score
+        available = filter(!ismissing, [lp, sp, cp, vp, jp])
+        isempty(uniq_motif_pvals) || append!(available, uniq_motif_pvals)
+        combined = isempty(available) ? missing : prod(Float64.(available))
+
+        push!(rows, (
+            cluster_id=i,
+            cluster_size=sizes[i],
+            cluster_type=types[i],
+            length_pval=lp,
+            size_pval=sp,
+            clone_pval=cp,
+            vgene_pval=vp,
+            jgene_pval=jp,
+            motifs=isempty(uniq_motif_strs) ? missing : join(uniq_motif_strs, ";"),
+            motif_pvals=isempty(uniq_motif_pvals) ? missing : join(string.(uniq_motif_pvals), ";"),
+            combined_score=combined,
+        ))
 
     end
 
-    motifs = first.(top_motifs)
-    m_pvals = last.(top_motifs)
+    return DataFrame(rows)
+end
 
-    df = DataFrame(
-        group=collect(1:length(clusters)),
-        no_member=cluster_sizes,
-        no_cdrs=cdr_sizes,
-        no_donor=donor_sizes,
-        length_pval=length_pvals,
-        vgene_pval=v_pvals,
-        vgene=vgenes,
-        motif_pval=m_pvals,
-        motif=motifs
-    )
+function summarize_cluster_cdr3s(g, min_size::Int)
 
-    return df
+    g = remove_small_clusters(g, min_size)
+    clusters, _ = get_clusters_and_sizes(g)
+
+    rows = []
+
+    for (i, cluster) in enumerate(clusters)
+
+        labels = label_for.(Ref(g), cluster)
+        cdr3s = String[]
+        indices = Int[]
+        tcr_id = String[]
+
+        for lbl in labels
+            meta = g[lbl]
+
+            push!(cdr3s, String(lbl))
+
+            if haskey(meta, :index)
+                push!(indices, meta[:index])
+            end
+
+            if haskey(meta, :tcr_ids)
+                bc = meta[:tcr_ids]
+                bc = bc isa AbstractVector ? bc : [bc]
+                append!(tcr_id, String.(bc))
+            end
+        end
+
+        push!(rows, (
+            cluster_id=i,
+            cdr3s=cdr3s,
+            row_ids=isempty(indices) ? missing : indices,
+            tcr_id=isempty(tcr_id) ? missing : tcr_id,
+        ))
+    end
+
+    return DataFrame(rows)
 
 end
 
-using Graphs
-using DataFrames
 
-function extract_clusters_table(g)
-    clusters = connected_components(g)
+# plotting
 
-    rows = NamedTuple[]
+function summarize_cdr3_lengths(df::DataFrame)
 
-    for (group_id, cluster) in enumerate(clusters)
-        for v in cluster
-            lbl = label_for(g, v)  # row_index label (your vertex label)
+    col = nothing
+    if "cdr3" in names(df)
+        col = :cdr3
+    end
 
-            cdr3 = haskey(g[lbl], :cdr3) ? String(g[lbl][:cdr3]) : ""
-            vgene = haskey(g[lbl], :vgene) ? String(g[lbl][:vgene]) : ""
-            jgene = haskey(g[lbl], :jgene) ? String(g[lbl][:jgene]) : ""
-            dgene = haskey(g[lbl], :dgene) ? String(g[lbl][:dgene]) : ""
-            donor = haskey(g[lbl], :donor) ? String(g[lbl][:donor]) : ""
+    col === nothing && error("No cdr3 column found in DataFrame")
 
-            push!(rows, (
-                group=group_id,
-                vertex_id=v,
-                row_index=lbl,
-                cdr3=cdr3,
-                donor=donor,
-                vgene=vgene,
-                jgene=jgene,
-                dgene=dgene,
-            ))
+    seqs = filter(!ismissing, df[:, col])
+    seqs = filter(x -> x ∉ ("", "NA", "None", "none"), String.(seqs))
+    seqs = unique(seqs)
+
+    lengths = length.(seqs)
+
+    tab = sort(DataFrame(countmap(lengths)), :first)
+    rename!(tab, :first => :cdr3_length, :second => :count)
+    tab[!, :freq] = tab.count ./ sum(tab.count)
+
+    return tab
+end
+
+function summarize_umi_distribution(df::DataFrame)
+
+    col = nothing
+    if "umis" in names(df)
+        col = :umis
+    elseif "clones" in names(df)
+        col = :clones
+    end
+
+    col === nothing && error("No UMI or clone count column found in DataFrame")
+
+    vals = filter(!ismissing, df[:, col])
+    vals = Float64.(vals)
+
+    isempty(vals) && error("UMI column is empty")
+
+    result = DataFrame(
+        metric=[
+            "n",
+            "mean",
+            "median",
+            "std",
+            "min",
+            "p25",
+            "p75",
+            "p90",
+            "p95",
+            "max",
+            "total",
+        ],
+        value=[
+            Float64(length(vals)),
+            mean(vals),
+            median(vals),
+            std(vals),
+            minimum(vals),
+            quantile(vals, 0.25),
+            quantile(vals, 0.75),
+            quantile(vals, 0.90),
+            quantile(vals, 0.95),
+            maximum(vals),
+            sum(vals),
+        ]
+    )
+
+    return result
+end
+
+function summarize_vgene(df::DataFrame)
+
+    col = nothing
+    if "vgene" in names(df)
+        col = :vgene
+    elseif "v_gene" in names(df)
+        col = :v_gene
+    else
+        return nothing
+    end
+
+    vals = filter(!ismissing, df[:, col])
+    vals = filter(x -> x ∉ ("", "NA", "None", "none"), String.(vals))
+    isempty(vals) && return nothing
+
+    cm = countmap(vals)
+    tab = DataFrame(vgene=collect(keys(cm)), count=collect(values(cm)))
+    sort!(tab, :count; rev=true)
+    tab[!, :freq] = tab.count ./ sum(tab.count)
+
+    return tab
+end
+
+
+function summarize_jgene(df::DataFrame)
+
+    col = nothing
+    if "jgene" in names(df)
+        col = :jgene
+    elseif "j_gene" in names(df)
+        col = :j_gene
+    else
+        return nothing
+    end
+
+    vals = filter(!ismissing, df[:, col])
+    vals = filter(x -> x ∉ ("", "NA", "None", "none"), String.(vals))
+    isempty(vals) && return nothing
+
+    tab = sort(DataFrame(countmap(vals)), :second => rev = true)
+    rename!(tab, :first => :jgene, :second => :count)
+    tab[!, :freq] = tab.count ./ sum(tab.count)
+
+    return tab
+end
+
+
+function summarize_dgene(df::DataFrame)
+
+    col = nothing
+    if "dgene" in names(df)
+        col = :dgene
+    elseif "d_gene" in names(df)
+        col = :d_gene
+    else
+        return nothing
+    end
+
+    vals = filter(!ismissing, df[:, col])
+    vals = filter(x -> x ∉ ("", "NA", "None", "none"), String.(vals))
+    isempty(vals) && return nothing
+
+    tab = sort(DataFrame(countmap(vals)), :second => rev = true)
+    rename!(tab, :first => :dgene, :second => :count)
+    tab[!, :freq] = tab.count ./ sum(tab.count)
+
+    return tab
+end
+
+
+function plot_distribution(df::DataFrame; title::String="", top_n::Int=20)
+
+    cols = names(df)
+
+    x_col = nothing
+    y_col = :freq
+
+    for c in cols
+        if c in ("vgene", "jgene", "dgene", "chain", "cdr3_length", "clonotype_id")
+            x_col = Symbol(c)
+            break
         end
     end
 
-    members = DataFrame(rows)
+    x_col === nothing && error("Could not detect category column in DataFrame. Columns: $cols")
 
-    summary = combine(groupby(members, :group),
-        nrow => :no_member,
-        :cdr3 => (x -> length(unique(x))) => :no_unique_cdr3,
-        :donor => (x -> length(unique(filter(!isempty, x)))) => :no_donor,
-        :vgene => (x -> length(unique(filter(!isempty, x)))) => :no_vgene,
+    plot_df = nrow(df) > top_n ? first(df, top_n) : df
+
+    plot_df = sort(plot_df, y_col; rev=true)
+
+    x_vals = string.(plot_df[:, x_col])
+    y_vals = plot_df[:, y_col]
+
+    fig = Figure(resolution=(max(600, length(x_vals) * 35), 500))
+    ax = Axis(
+        fig[1, 1];
+        title=isempty(title) ? string(x_col) * " distribution" : title,
+        xlabel=string(x_col),
+        ylabel="frequency",
+        xticks=(1:length(x_vals), x_vals),
+        xticklabelrotation=π / 3,
+        xticklabelsize=11,
     )
 
-    return (members=members, summary=summary)
+    barplot!(ax, 1:length(x_vals), y_vals; color=:steelblue)
+
+    return fig
 end
+
+#plot_distribution(summarize_vgene(df); title="V Gene Usage")
+#plot_distribution(summarize_jgene(df); title="J Gene Usage")
+#plot_distribution(summarize_dgene(df); title="D Gene Usage")
+#plot_distribution(summarize_cdr3_lengths(df); title="CDR3 Length Distribution")
+#plot_distribution(summarize_chain_usage(df); title="Chain Usage")
+
+export is_t_gene,
+    is_cdr3,
+    load_cdr3s,
+    load_cdr3_fasta,
+    make_hamming_distance,
+    make_symmetric!,
+    make_blosum_score,
+    make_distance,
+    get_motif_counts,
+    get_motifs,
+    find_significant_motifs,
+    make_motif_pairs,
+    make_vertices!,
+    add_global_edge!,
+    add_local_edge!,
+    make_edges,
+    get_clusters_and_sizes,
+    remove_small_clusters,
+    load_cdr3len_freqs,
+    find_length_pvals,
+    find_length_pvals_sampling,
+    find_size_pval,
+    load_vgene_freqs,
+    find_vgene_pval,
+    find_vgene_pval_sampling,
+    find_jgene_pval_sampling,
+    motif_hits_by_cdr3,
+    find_cluster_motif_pval,
+    find_global_motif_pval,
+    find_clone_pval,
+    find_cluster_type,
+    summarize_clusters,
+    summarize_cluster_cdr3s,
+    summarize_cdr3_lengths,
+    summarize_umi_distribution,
+    summarize_vgene,
+    summarize_jgene,
+    summarize_dgene,
+    plot_distribution
+
 end

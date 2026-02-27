@@ -1,0 +1,389 @@
+# function editing
+
+#- Network size done done
+#- CDR3 length score done
+#- V gene score done
+#- Clonal expansion score done
+# Islocal / isglobal function done
+
+using Random
+using StatsBase  # sample, countmap
+using Graphs
+
+# you already have this
+function get_clusters_and_sizes(g)
+    clusters = connected_components(g)
+    sizes = [length(c) for c in clusters]
+    return clusters, sizes
+end
+
+"""
+network_size_pvals_freq
+
+Compute network.size.score-like p-values via simulation.
+
+- g_sample: your built MetaGraph from the sample
+- cdrs_ref: reference DataFrame you can pass to make_edges (must include :cdr3)
+- motifs:   output of find_significant_motifs (iterable of (motif => pval))
+- nsim:     number of simulations
+- isglobal/islocal: must match how you built g_sample
+- min_cluster_size: ignore clusters smaller than this in both observed & simulated
+- pval uses: fraction of sims where (max cluster size) >= observed size
+"""
+function network_size_pvals_freq(
+    g_sample,
+    cdrs_ref,
+    motifs;
+    nsim::Int=500,
+    isglobal::Bool=true,
+    islocal::Bool=true,
+    min_cluster_size::Int=2,
+    rng::AbstractRNG=Random.default_rng(),
+)
+
+    n_sample = nv(g_sample)
+    n_ref = nrow(cdrs_ref)
+    n_ref >= n_sample || error("Reference set must have at least as many rows as the sample graph vertices.")
+
+    # observed cluster sizes
+    clusters_obs, sizes_obs_all = get_clusters_and_sizes(g_sample)
+    keep = findall(>=(min_cluster_size), sizes_obs_all)
+    clusters_obs = clusters_obs[keep]
+    sizes_obs = sizes_obs_all[keep]
+
+    # if nothing to score
+    if isempty(sizes_obs)
+        return (
+            clusters=clusters_obs,
+            sizes=Int[],
+            pvals=Float64[],
+            sim_max_sizes=Int[],
+            sim_max_hist=Dict{Int,Int}(),
+        )
+    end
+
+    # simulate: store max cluster size per simulation
+    sim_max_sizes = Vector{Int}(undef, nsim)
+
+    for sim in 1:nsim
+        idx = sample(rng, 1:n_ref, n_sample; replace=false)
+        sub = cdrs_ref[idx, :]
+
+        # reindex rows so your make_edges() indexing is consistent
+        sub[!, :row_index] = collect(1:nrow(sub))
+
+        g_ref = make_edges(sub, motifs, isglobal, islocal)
+        _, sim_sizes = get_clusters_and_sizes(g_ref)
+
+        # apply same min_cluster_size filter
+        sim_sizes = [s for s in sim_sizes if s >= min_cluster_size]
+
+        sim_max_sizes[sim] = isempty(sim_sizes) ? 0 : maximum(sim_sizes)
+    end
+
+    # histogram (optional, but useful for debugging/plotting)
+    sim_max_hist = countmap(sim_max_sizes)
+
+    # pval per observed cluster size: P(max >= size)
+    pvals = Float64[]
+    for s_obs in sizes_obs
+        wins = count(>=(s_obs), sim_max_sizes)
+        p = wins / nsim
+        p = (p == 0.0) ? (1.0 / nsim) : p
+        push!(pvals, p)
+    end
+
+    return (
+        clusters=clusters_obs,
+        sizes=sizes_obs,
+        pvals=pvals,
+        sim_max_sizes=sim_max_sizes,
+        sim_max_hist=sim_max_hist,
+    )
+end
+
+#to do:
+#- Clonal expansion score function
+
+
+#length score
+
+function find_length_pvals(g, cdrs2, sim_depth)
+    clusters = connected_components(g)
+
+    modes = Vector{Int}()
+    props = Vector{Float64}()
+
+    # get most common length for each cluster
+    for cluster in clusters
+
+        labels = label_for.(Ref(g), cluster)
+
+        cluster_lengths = Int[]
+
+        for lbl in labels
+
+            haskey(g[lbl], :cdr3) || continue
+            push!(cluster_lengths, length(String(g[lbl][:cdr3])))
+
+        end
+
+        m = mode(cluster_lengths)
+        push!(modes, m)
+        push!(props, count(==(m), cluster_lengths) / length(cluster_lengths))
+
+    end
+
+    # randomly pick n sequences from the null distribution and compare to
+    cluster_sizes = [length(cluster) for cluster in clusters]
+    p_vals = Float64[]
+
+    for (index, size) in enumerate(cluster_sizes)
+
+        sim_props = Float64[]
+
+        for i in 1:sim_depth
+            random_cdrs = sample(cdrs2, size; replace=true, ordered=false)
+            cluster_lengths = [length(s) for s in random_cdrs]
+            push!(sim_props, (count(==(modes[index]), cluster_lengths)) / size)
+        end
+
+        # count number of times sim beats data?
+        p_val = ((count(>=(props[index]), sim_props)) + 1) / (sim_depth + 1)
+        push!(p_vals, p_val)
+
+    end
+
+    return p_vals
+
+end
+
+function find_clone_pval(g, cdrs2, sim_depth)
+    clusters = connected_components(g)
+
+    # observed mean clone size per cluster
+    sample_scores = Float64[]
+    cluster_sizes = Int[]
+
+    for cluster in clusters
+        labels = label_for.(Ref(g), cluster)
+
+        clones = Float64[]
+        for lbl in labels
+            haskey(g[lbl], :clones) || continue
+            append!(clones, Float64.(g[lbl][:clones]))  # :clones is a vector of counts for that CDR3
+        end
+
+        n = length(cluster)              # cluster size of vertices from the graph
+        push!(cluster_sizes, n)
+
+        if isempty(clones)
+            push!(sample_scores, 0.0)    # no clone info; will yield p=1 below
+        else
+            push!(sample_scores, sum(clones) / length(clones))  # mean clone count per sequence
+        end
+    end
+
+    # simulate: sample cluster-size vertices (with replacement) from cdrs2 and compare mean clone size
+    p_vals = Float64[]
+    for (index, size) in enumerate(cluster_sizes)
+
+        if size == 0
+            push!(p_vals, 1.0)
+            continue
+        end
+
+        sample_score = sample_scores[index]
+        counter = 0
+
+        for i in 1:sim_depth
+            random_cdrs = sample(cdrs2, size; replace=true, ordered=false)
+
+            clones = Float64[]
+            for s in random_cdrs
+                append!(clones, Float64.(s[:clones]))
+            end
+
+            test_score = isempty(clones) ? 0.0 : (sum(clones) / length(clones))
+            if test_score >= sample_score
+                counter += 1
+            end
+        end
+
+        score = (counter == 0) ? (1 / sim_depth) : (counter / sim_depth)
+        push!(p_vals, score)
+    end
+
+    return p_vals
+end
+
+
+function classify_cluster_edge_types(g)
+    clusters = connected_components(g)
+    types = Vector{Symbol}(undef, length(clusters))
+
+    for (i, cluster) in enumerate(clusters)
+        has_distance = false
+        has_motifs = false
+        saw_edge = false
+
+        # iterate edges induced by the cluster
+        for a in 1:length(cluster)-1
+            u = cluster[a]
+            for b in a+1:length(cluster)
+                v = cluster[b]
+
+                has_edge(g, u, v) || continue
+                saw_edge = true
+
+                e = edge(g, u, v)
+
+                # edge metadata checks
+                if haskey(g[e], :distance)
+                    has_distance = true
+                end
+                if haskey(g[e], :motifs)
+                    has_motifs = true
+                end
+
+                # early exit if already mixed
+                if has_distance && has_motifs
+                    types[i] = :mixed
+                    @goto done_cluster
+                end
+            end
+        end
+
+        if !saw_edge
+            types[i] = :none
+        elseif has_distance && !has_motifs
+            types[i] = :global
+        elseif has_motifs && !has_distance
+            types[i] = :local
+        else
+            # edges exist but neither key found anywhere
+            types[i] = :none
+        end
+
+        @label done_cluster
+    end
+
+    return types
+end
+
+# finds motif hits for reference
+function motif_hits_by_cdr3(cdr3s::AbstractVector{<:AbstractString},
+    motifs::AbstractVector{<:AbstractString})
+
+    hits = Dict{String,Dict{Int,Vector{Int}}}()
+
+
+    matchers = Dict{String,Union{Nothing,Regex}}()
+
+    for m in motifs
+
+        hits[m] = Dict{Int,Vector{Int}}()
+        matchers[m] = occursin('.', m) ? Regex(m) : nothing
+
+    end
+
+    for (i, s_) in pairs(cdr3s)
+        s = uppercase(replace(String(s_), r"\s+" => ""))
+        core = (lastindex(s) < 7) ? "" : s[4:(end-3)]
+        isempty(core) && continue
+
+
+        for motif in motifs
+
+            rx = matchers[motif]
+            start = firstindex(core)
+            pos = Int[]
+
+            while true
+                r = rx === nothing ? findnext(motif, core, start) : findnext(rx, core, start)
+                r === nothing && break
+                p = first(r)
+                push!(pos, p)
+                start = p + 1
+                start > lastindex(core) && break
+            end
+
+            if !isempty(pos)
+                hits[motif][i] = pos
+            end
+
+        end
+    end
+
+    return hits
+
+end
+
+
+using HypothesisTests
+
+function motif_scoring(g; ref_hits::Dict{String,<:Any}, N_ref::Int, tail::Symbol=:right)
+
+    clusters = connected_components(g)
+    N_sample = nv(g)
+
+    cluster_motifs = Vector{Vector{Tuple{String,Float64}}}(undef, length(clusters))
+
+    for (index, cluster) in enumerate(clusters)
+
+        in_cluster = falses(N_sample)
+        in_cluster[cluster] .= true
+
+        # motif => Set of vertices in this cluster that are incident to an edge carrying that motif
+        motif_vertices = Dict{String,Set{Int}}()
+
+        for u in cluster
+            for v in neighbors(g, u)
+
+                if in_cluster[v] && u < v
+
+                    lu = label_for(g, u)
+                    lv = label_for(g, v)
+
+                    if haskey(g, lu, lv) && haskey(g[lu, lv], :motifs)
+
+                        motifs = g[lu, lv][:motifs]::Vector{String}
+
+                        for motif in motifs
+                            s = get!(motif_vertices, motif, Set{Int}())
+                            push!(s, u)
+                            push!(s, v)
+                        end
+
+                    end
+                end
+            end
+        end
+
+        pairs = Tuple{String,Float64}[]
+
+        for (motif, vertex_set) in motif_vertices
+
+            k_obs = length(vertex_set)
+            k_ref = haskey(ref_hits, motif) ? length(ref_hits[motif]) : 0
+
+            if N_ref <= 0 || k_ref <= 0
+                push!(pairs, (motif, 1.0))
+                continue
+            end
+
+            t = FisherExactTest(k_obs,
+                N_sample - k_obs,
+                k_ref,
+                N_ref - k_ref)
+
+            p = pvalue(t, tail=tail)
+
+            push!(pairs, (motif, p))
+        end
+
+        cluster_motifs[index] = pairs
+    end
+
+    return cluster_motifs
+end
